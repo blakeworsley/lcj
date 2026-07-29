@@ -8,7 +8,10 @@ cookie — paste it once, no keychain access, no API key setup.
 
 **Left column:** 5-hour session gauge · `RESETS` time for that window (12 or 24h, follows your system setting)  
 **Right column:** `WK` weekly usage across all models · `F` Fable weekly usage  
-**Colors:** green <70% · yellow 70–89% · red ≥90%
+**Colors:** green <70% · yellow 70–89% · red ≥90%  
+**Auto-refresh:** every 5 minutes by default (plus an immediate fetch on wake) — pick
+1/2/3/5/8/13 minutes via **Refresh Every** in the dropdown; the choice persists in the
+`com.mlg87.clusage-menubar` preferences domain under key `refresh_interval_minutes`.
 
 ---
 

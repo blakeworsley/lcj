@@ -109,15 +109,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Refresh cadence
 
     private func setupRefreshTimer() {
-        // Fixed 5-min cadence (clud's default; no settings UI in v0.1.0).
+        // Cadence comes from RefreshIntervalStore (user-selectable via the
+        // "Refresh Every" submenu); it defaults to the historical 5-min value.
+        // WHY invalidate() first: this is also called from setRefreshInterval(_:)
+        // when the user picks a new interval, so it must be safe to re-enter.
+        refreshTimer?.invalidate()
+        let seconds = TimeInterval(RefreshIntervalStore.load() * 60)
         // WHY Task { @MainActor in }: Timer callbacks are nonisolated from Swift 6's static
         // perspective even though scheduledTimer runs on the main run loop. The Task hop is
         // a no-op at runtime (already on main) but satisfies the type system without using
         // DispatchQueue.main.async (which is unstructured and harder to reason about).
-        let timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.fetcher.fetchNow() }
         }
-        timer.tolerance = 30   // let the OS batch with other timers; saves battery
+        // Proportional slack lets the OS batch with other timers (saves battery);
+        // 10% preserves the previous 30s-at-5-min ratio at every interval.
+        timer.tolerance = seconds * 0.1
         refreshTimer = timer
     }
 
@@ -156,6 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         addRefreshItem(to: menu)
+        addRefreshIntervalItem(to: menu)
         addSetCookieItem(to: menu)
         addLaunchAtLoginItem(to: menu)
         menu.addItem(.separator())
@@ -235,6 +243,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func refreshNow() {
         fetcher.fetchNow()
+    }
+
+    private func addRefreshIntervalItem(to menu: NSMenu) {
+        // Menu is rebuilt on every open (menuNeedsUpdate), so the checkmark
+        // re-reads the stored value here and needs no separate state sync.
+        let parent = NSMenuItem(title: "Refresh Every", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let current = RefreshIntervalStore.load()
+        for minutes in RefreshInterval.allowedMinutes {
+            let title = minutes == 1 ? "1 minute" : "\(minutes) minutes"
+            let item = NSMenuItem(title: title, action: #selector(setRefreshInterval(_:)), keyEquivalent: "")
+            item.tag = minutes   // carries the chosen value to the action
+            item.state = minutes == current ? .on : .off
+            item.target = self
+            submenu.addItem(item)
+        }
+        parent.submenu = submenu
+        menu.addItem(parent)
+    }
+
+    @objc private func setRefreshInterval(_ sender: NSMenuItem) {
+        RefreshIntervalStore.save(sender.tag)
+        setupRefreshTimer()   // restart the cadence immediately at the new interval
     }
 
     private func addSetCookieItem(to menu: NSMenu) {
