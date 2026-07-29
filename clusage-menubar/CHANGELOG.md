@@ -5,6 +5,14 @@ All notable changes to clusage-menubar.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/mlg87/lcj/compare/clusage-menubar-v0.5.0...clusage-menubar-v0.6.0) (2026-07-29)
+
+
+### Features
+
+* **clusage-menubar:** configurable refresh interval (1/2/3/5/8/13 min) ([72526e9](https://github.com/mlg87/lcj/commit/72526e92cff612347b8634e55ba4c8914f95badf))
+* **clusage-menubar:** configurable refresh interval (1/2/3/5/8/13 min) ([f535f21](https://github.com/mlg87/lcj/commit/f535f210d636fefd1ed68e2a48790fc0133d47cf))
+
 ## [0.5.0](https://github.com/mlg87/lcj/compare/clusage-menubar-v0.4.0...clusage-menubar-v0.5.0) (2026-07-11)
 
 
