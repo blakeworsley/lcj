@@ -218,6 +218,18 @@ func testMenuBarShortLabel() {
     expectEqual(menuBarShortLabel("  "), "–", "blank label falls back to dash")
 }
 
+// MARK: - Tests: RefreshInterval
+
+func testRefreshIntervalNormalize() {
+    for m in RefreshInterval.allowedMinutes {
+        expectEqual(RefreshInterval.normalize(m), m, "allowed value \(m) passes through")
+    }
+    expectEqual(RefreshInterval.normalize(0), 5, "absent (0) falls back to default")
+    expectEqual(RefreshInterval.normalize(4), 5, "disallowed value falls back to default")
+    expectEqual(RefreshInterval.normalize(-1), 5, "negative falls back to default")
+    expectEqual(RefreshInterval.defaultMinutes, 5, "default stays the historical 5-min cadence")
+}
+
 // MARK: - Run all tests
 
 print("Running ClusageTests…")
@@ -231,6 +243,7 @@ testOrgIdFromCookie()
 testMenuBarTime()
 testBand()
 testMenuBarShortLabel()
+testRefreshIntervalNormalize()
 
 if failures == 0 {
     print("OK — all tests passed")
