@@ -7,6 +7,10 @@
     "clusage-menubar": {
       "release-type": "simple",
       "package-name": "clusage-menubar"
+    },
+    "clodex-menubar": {
+      "release-type": "simple",
+      "package-name": "clodex-menubar"
     }
   }
 }

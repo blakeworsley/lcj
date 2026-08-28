@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Binary and bundle identity -->
+    <key>CFBundleExecutable</key>
+    <string>ClodexMenubar</string>
+    <key>CFBundleName</key>
+    <string>ClodexMenubar</string>
+    <key>CFBundleDisplayName</key>
+    <string>Clodex</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.clodex.menubar</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+
+    <!-- Hide from Dock and application switcher; show only in menu bar -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Minimum macOS: 13.0 (SMAppService for Launch at Login) -->
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+
+    <!-- Version placeholders — build.sh overwrites both from version.txt via PlistBuddy -->
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.0.0</string>
+</dict>
+</plist>

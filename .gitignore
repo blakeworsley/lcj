@@ -19,3 +19,8 @@ clusage-menubar/*.dmg
 clusage-menubar/dmg_temp/
 clusage-menubar/*.icns
 clusage-menubar/*.iconset/
+
+# clodex-menubar build artifacts
+clodex-menubar/.build/
+clodex-menubar/build/
+clodex-menubar/*.dmg

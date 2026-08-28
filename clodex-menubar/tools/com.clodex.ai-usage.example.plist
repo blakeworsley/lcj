@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Example launchd agent for the optional AI usage ledger.
+
+  Setup:
+    1. Replace every YOUR_USERNAME below with your macOS username, and adjust
+       the repo path and (optionally) an - -out-dir argument for the ledger
+       location (default: ~/.clodex/ai-usage).
+    2. cp tools/com.clodex.ai-usage.example.plist \
+          ~/Library/LaunchAgents/com.clodex.ai-usage.plist
+    3. launchctl bootstrap gui/$(id -u) \
+          ~/Library/LaunchAgents/com.clodex.ai-usage.plist
+-->
+<dict>
+    <key>Label</key>
+    <string>com.clodex.ai-usage</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/YOUR_USERNAME/path/to/clodex-menubar/tools/ai_usage_snapshot.py</string>
+        <string>--quiet</string>
+    </array>
+    <!-- 4 daily snapshots; RunAtLoad catches up after sleep/restart gaps. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>15</integer></dict>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.clodex/ai-usage/run.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.clodex/ai-usage/run.log</string>
+</dict>
+</plist>

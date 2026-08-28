@@ -8,6 +8,7 @@ Monorepo for personal Claude Code skills, plugins, and related tooling.
 |---|---|
 | [`clud/`](./clud/) | **Claude HUD** — an iTerm2 toolbelt panel that mirrors live Claude Code session state (todos, current tool, model, project) for whichever Claude tab is focused. |
 | [`clusage-menubar/`](./clusage-menubar/) | **Clusage** — a macOS menu bar app showing Claude 5h / weekly / Fable usage as a compact two-column grid of progress bars, authenticated by your claude.ai session cookie. |
+| [`clodex-menubar/`](./clodex-menubar/) | **Clodex** — a macOS menu bar app showing Claude and Codex usage side by side: Claude limit gauges (zero-setup via the Claude Code CLI's sign-in), the Codex monthly limit gauge from ChatGPT spend controls, dollar-cost estimates from local session logs, and 8 switchable menu bar styles. |
 
 More to come.
 
