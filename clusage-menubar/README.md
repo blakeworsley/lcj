@@ -16,6 +16,34 @@ cookie — paste it once, no keychain access, no API key setup.
 
 ---
 
+## Menu bar layouts
+
+**Menu Bar Layout** in the dropdown switches between two layouts (persisted under
+`menubar_style`):
+
+- **Usage Grid** (default) — the layout above: percent *used* per limit, the 5h
+  reset time in its own `RESETS` cell, Codex costs in the third column.
+- **Remaining Capacity** — answers "how much room is left, and when do I get
+  more?" at a glance:
+
+  ```
+  ✻  5h  ▰▱▱▱▱ 24% left · ↻19m   │  ✿  Mo  ▰▱▱▱▱ 21% left · ↻19d
+     Wk  ▰▰▰▱▱ 56% left · ↻3d    │
+  ```
+
+  One block per provider, marked by an icon (✻ Claude, the OpenAI blossom for
+  Codex). Every displayed limit is a segmented bar that *drains* as you use
+  capacity, followed by `% left` and a `↻` countdown to its reset — exact
+  dates/times stay in the dropdown. The model-specific weekly limit replaces the
+  all-models week only when it is the tighter one (labelled `Wk(F)`). Codex shows
+  the real monthly limit when ChatGPT reports one, otherwise your personal budget,
+  labelled `Budget` so it can't be mistaken for a provider limit (past the budget
+  it reads `$18 over`). Dollar estimates and secondary limits live in the dropdown.
+  Colour signals attention rather than consumption: neutral bars, **amber** when
+  ≤30% remains, **red** when ≤10% remains.
+
+---
+
 ## Codex column
 
 If the OpenAI Codex CLI (or Codex Desktop) is installed — i.e. `~/.codex/sessions`

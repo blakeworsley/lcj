@@ -448,6 +448,38 @@ func testMenuBarShortDate() {
     expectEqual(menuBarShortDate(nil), "–", "menuBarShortDate: nil date dashes")
 }
 
+// MARK: - Tests: Remaining-capacity layout helpers
+
+func testMenuBarCountdown() {
+    let (_, now) = codexTestCalendar()
+    func inSecs(_ s: TimeInterval) -> Date { now.addingTimeInterval(s) }
+    expectEqual(menuBarCountdown(to: nil, from: now), "–", "countdown: nil → dash")
+    expectEqual(menuBarCountdown(to: inSecs(30), from: now), "<1m", "countdown: under a minute")
+    expectEqual(menuBarCountdown(to: inSecs(-100), from: now), "<1m", "countdown: past date clamps")
+    expectEqual(menuBarCountdown(to: inSecs(38 * 60), from: now), "38m", "countdown: minutes only")
+    expectEqual(menuBarCountdown(to: inSecs(2 * 3600 + 14 * 60), from: now), "2h14m", "countdown: hours + minutes")
+    expectEqual(menuBarCountdown(to: inSecs(3 * 3600), from: now), "3h", "countdown: whole hours drop minutes")
+    expectEqual(menuBarCountdown(to: inSecs(4 * 86400 + 9 * 3600 + 30 * 60), from: now), "4d9h",
+                "countdown: days + hours, minutes dropped")
+    expectEqual(menuBarCountdown(to: inSecs(5 * 86400 + 20 * 60), from: now), "5d", "countdown: whole days drop hours")
+}
+
+func testStartOfNextMonth() {
+    let (cal, now) = codexTestCalendar()   // 2026-08-26 14:00 Denver
+    let next = startOfNextMonth(after: now, calendar: cal)
+    expectEqual(next, cal.date(from: DateComponents(year: 2026, month: 9, day: 1)), "next month: Sep 1 local midnight")
+    let dec = cal.date(from: DateComponents(year: 2026, month: 12, day: 31, hour: 23))!
+    expectEqual(startOfNextMonth(after: dec, calendar: cal),
+                cal.date(from: DateComponents(year: 2027, month: 1, day: 1)), "next month: year rollover")
+}
+
+func testMenuBarStyleNormalize() {
+    expectEqual(MenuBarStyle.normalize(nil), .grid, "style: absent → grid (pre-existing layout)")
+    expectEqual(MenuBarStyle.normalize("bogus"), .grid, "style: unknown → grid")
+    expectEqual(MenuBarStyle.normalize("remaining"), .remaining, "style: remaining round-trips")
+    expectEqual(MenuBarStyle.defaultStyle, .grid, "style: default stays the historical grid")
+}
+
 // MARK: - Run all tests
 
 print("Running ClusageTests…")
@@ -470,6 +502,9 @@ testBudgetBarometer()
 testFormatCostAndTokens()
 testCodexPlanUsageParse()
 testMenuBarShortDate()
+testMenuBarCountdown()
+testStartOfNextMonth()
+testMenuBarStyleNormalize()
 
 if failures == 0 {
     print("OK — all tests passed")

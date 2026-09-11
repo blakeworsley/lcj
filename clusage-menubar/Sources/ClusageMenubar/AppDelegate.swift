@@ -27,6 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var latestCodexState: CodexScanState?
     private var latestPlanState: CodexPlanState?
     private var refreshTimer: Timer?
+    /// Minute tick that repaints countdowns in the Remaining layout; display only.
+    private var countdownTimer: Timer?
 
     // MARK: - applicationDidFinishLaunching
 
@@ -81,6 +83,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Custom view: draw inside the button's bounds. hitTest returns nil so
         // clicks fall through to the button → opens the menu.
         statusView = StatusBarView(frame: button.bounds)
+        statusView.style = MenuBarStyleStore.load()
+        setupCountdownTimer()
         statusView.codexColumnEnabled = CodexDisplayStore.isColumnVisible()
         statusView.codexShowsDollars = CodexDisplayStore.showsDollars()
         statusView.codexBudget = CodexBudgetStore.load()
@@ -185,6 +189,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTimer = timer
     }
 
+    /// The Remaining layout shows "↻19m" countdowns, which go stale between data
+    /// refreshes; repaint each minute while that layout is active. No I/O.
+    private func setupCountdownTimer() {
+        countdownTimer?.invalidate()
+        guard statusView.style == .remaining else {
+            countdownTimer = nil
+            return
+        }
+        let timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.redraw() }
+        }
+        timer.tolerance = 5
+        countdownTimer = timer
+    }
+
     private func setupWakeObserver() {
         // Re-fetch immediately after wake: usage data is likely stale post-sleep.
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -239,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         addRefreshItem(to: menu)
         addRefreshIntervalItem(to: menu)
+        addMenuBarLayoutItem(to: menu)
         addCodexColumnItem(to: menu)
         addSetCookieItem(to: menu)
         addLaunchAtLoginItem(to: menu)
@@ -278,7 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 default: kindLabel = "Weekly (all models)"
                 }
                 resetsStr = menuDetailTime(b.resetsAt)
-                label = "\(kindLabel): \(b.percent)% — resets \(resetsStr)"
+                label = "\(kindLabel): \(b.percent)% used — resets \(resetsStr)"
             } else {
                 label = kind == "session" ? "Session (5h): –" :
                         kind == "weekly_scoped" ? "Fable (week): –" :
@@ -331,7 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let budget = CodexBudgetStore.load()
             let pct = budget > 0 ? Int((summary.monthToDateCost / budget * 100).rounded()) : 0
             addDisabledRow(to: menu, title:
-                "This month: ≈\(formatCost(summary.monthToDateCost)) — \(pct)% of \(formatCost(budget))/mo budget")
+                "This month: ≈\(formatCost(summary.monthToDateCost)) — \(pct)% of your \(formatCost(budget))/mo budget (personal budget, not a provider limit)")
         }
         for m in summary.perModel {
             addDisabledRow(to: menu, title:
@@ -355,7 +375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     "⚠︎ Monthly limit REACHED — \(Int(plan.limitCredits.rounded())) credits, resets \(resets)")
             } else {
                 addDisabledRow(to: menu, title:
-                    "Monthly limit: \(plan.usedPercent)% — "
+                    "Monthly limit (ChatGPT spend control): \(plan.usedPercent)% used — "
                     + "\(Int(plan.usedCredits.rounded())) / \(Int(plan.limitCredits.rounded())) credits"
                     + " — resets \(resets)")
             }
@@ -395,7 +415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // The spend-control row already answers the limit question.
         } else {
             let plan = limit.planType.map { " (\($0) plan)" } ?? ""
-            addDisabledRow(to: menu, title: "No limit/balance reported by OpenAI\(plan)")
+            addDisabledRow(to: menu, title: "No provider limit or balance reported by OpenAI\(plan) — MO gauge uses your budget")
         }
     }
 
@@ -445,6 +465,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func setRefreshInterval(_ sender: NSMenuItem) {
         RefreshIntervalStore.save(sender.tag)
         setupRefreshTimer()   // restart the cadence immediately at the new interval
+    }
+
+    // MARK: Menu bar layout
+
+    private func addMenuBarLayoutItem(to menu: NSMenu) {
+        // Menu is rebuilt on every open, so the checkmark re-reads the stored value.
+        let parent = NSMenuItem(title: "Menu Bar Layout", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let current = MenuBarStyleStore.load()
+        for (i, style) in MenuBarStyle.allCases.enumerated() {
+            let item = NSMenuItem(title: style.displayName, action: #selector(setMenuBarStyle(_:)), keyEquivalent: "")
+            item.tag = i   // index into MenuBarStyle.allCases
+            item.state = style == current ? .on : .off
+            item.target = self
+            submenu.addItem(item)
+        }
+        parent.submenu = submenu
+        menu.addItem(parent)
+    }
+
+    @objc private func setMenuBarStyle(_ sender: NSMenuItem) {
+        let styles = MenuBarStyle.allCases
+        guard styles.indices.contains(sender.tag) else { return }
+        MenuBarStyleStore.save(styles[sender.tag])
+        statusView.style = styles[sender.tag]
+        setupCountdownTimer()
+        redraw()
     }
 
     // MARK: Codex column settings

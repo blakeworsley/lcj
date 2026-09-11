@@ -13,6 +13,12 @@
 /// The MO cell is a real percent-of-limit gauge when ChatGPT reports a monthly
 /// spend control, otherwise a month-to-date $ against the user's budget.
 ///
+/// A second layout, MenuBarStyle.remaining, answers "how much room is left and
+/// when do I get more?" directly: two provider blocks (✻ Claude / ✿ Codex), each
+/// limit as a draining segmented bar with "N% left · ↻countdown", dollars kept
+/// in the dropdown. Neutral bars; amber when capacity is low; red when nearly
+/// exhausted — colour means "needs attention", not "how much was consumed".
+///
 /// Rendering is pure NSColor / NSBezierPath so it adapts automatically to light/dark
 /// menu bar appearance (all colors are dynamic NSColor semantics).
 
@@ -69,6 +75,9 @@ final class StatusBarView: NSView {
     var codexPlan: CodexPlanUsage?
     /// The user's "Show in Menu Bar" preference for the Codex column.
     var codexColumnEnabled = true
+    /// Which layout to draw (MenuBarStyleStore). AppDelegate repaints every
+    /// minute in .remaining so the countdowns stay current.
+    var style: MenuBarStyle = .grid
 
     /// The Codex column renders only with the preference on AND some Codex data
     /// available. codexSummary is nil until the first successful scan and stays
@@ -109,6 +118,13 @@ final class StatusBarView: NSView {
     /// Compute the total drawing width for the current content.
     /// Called externally by AppDelegate to set statusItem.length.
     func preferredWidth() -> CGFloat {
+        switch style {
+        case .grid:      return gridPreferredWidth()
+        case .remaining: return remainingPreferredWidth()
+        }
+    }
+
+    private func gridPreferredWidth() -> CGFloat {
         let m = gridMetrics()
         let sepUnit = Self.sepPad + Self.sepW + Self.sepPad
         var w = 2 + m.leftColW + sepUnit + m.rightColW + 2
@@ -164,6 +180,13 @@ final class StatusBarView: NSView {
     // MARK: - Drawing
 
     override func draw(_ dirtyRect: NSRect) {
+        switch style {
+        case .grid:      drawGrid()
+        case .remaining: drawRemaining()
+        }
+    }
+
+    private func drawGrid() {
         let e = entriesForDisplay()
         let m = gridMetrics()
         let midY = bounds.midY
@@ -367,6 +390,208 @@ final class StatusBarView: NSView {
                        top: .text(c.week, tint: .labelColor),
                        bottom: c.monthReset.map { .text($0, tint: .labelColor) } ?? .empty),
         ]
+    }
+
+    // MARK: - Remaining-capacity style
+    //
+    //   ✻  5h  ▰▱▱▱▱ 24% left · ↻19m   │  ✿  Mo  ▰▱▱▱▱ 21% left · ↻19d
+    //      Wk  ▰▰▰▱▱ 56% left · ↻3d    │
+    //
+    // One block per provider, marked by an icon spanning both rows. Each row is
+    // one limit: label · draining segmented bar · "% left" · reset countdown.
+    // The model-scoped weekly limit replaces the all-models one only when it is
+    // the tighter of the two (labelled "Wk(F)"). Codex shows the real monthly
+    // limit when ChatGPT reports one, otherwise the personal $ budget, labelled
+    // "Budget" so it is never mistaken for a provider limit.
+
+    private static let segCount = 5
+    private static let segW: CGFloat = 4
+    private static let segGap: CGFloat = 1
+    private static var segTrackW: CGFloat { CGFloat(segCount) * segW + CGFloat(segCount - 1) * segGap }
+    /// Labels carry the meaning of each row, so they get full label colour and
+    /// bold weight here (the grid's secondaryLabelColor reads faint on tinted bars).
+    private static let remLabelFont = NSFont.systemFont(ofSize: 7, weight: .bold)
+    private static let iconFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+    private static let claudeIcon = "✻"
+    private static let blossomSize: CGFloat = 10
+    private static let iconRowGap: CGFloat = 4    // icon → first label
+
+    private struct RemainingRow {
+        let label: String
+        /// 0–100 fill for the bar; nil draws an empty track ("no data").
+        let remaining: Int?
+        let text: String
+        /// nil → neutral.
+        let band: Band?
+    }
+
+    private func remainingRow(label: String, bucket: Bucket?, now: Date) -> RemainingRow {
+        guard let b = bucket else {
+            return RemainingRow(label: label, remaining: nil, text: "– · ↻–", band: nil)
+        }
+        let left = 100 - b.percent
+        return RemainingRow(label: label, remaining: left,
+                            text: "\(left)% left · ↻\(menuBarCountdown(to: b.resetsAt, from: now))",
+                            band: band(forPercent: b.percent))
+    }
+
+    private func claudeRemainingRows(now: Date) -> [RemainingRow] {
+        guard !isDegraded, let snap = snapshot else {
+            return [remainingRow(label: "5h", bucket: nil, now: now),
+                    remainingRow(label: "Wk", bucket: nil, now: now)]
+        }
+        var rows = [remainingRow(label: "5h", bucket: snap.session, now: now)]
+        // Only surface the model-scoped week when it's what will actually stop
+        // you first; otherwise the all-models week is the one that matters.
+        if let scoped = snap.weeklyScoped, let all = snap.weeklyAll, scoped.percent > all.percent {
+            rows.append(remainingRow(label: "Wk(\(menuBarShortLabel(scoped.label)))", bucket: scoped, now: now))
+        } else {
+            rows.append(remainingRow(label: "Wk", bucket: snap.weeklyAll ?? snap.weeklyScoped, now: now))
+        }
+        return rows
+    }
+
+    private func codexRemainingRows(now: Date) -> [RemainingRow] {
+        if let plan = codexPlan {
+            let left = 100 - plan.usedPercent
+            return [RemainingRow(label: "Mo", remaining: left,
+                                 text: "\(left)% left · ↻\(menuBarCountdown(to: plan.resetsAt, from: now))",
+                                 band: band(forPercent: plan.usedPercent))]
+        }
+        guard let s = codexSummary else {
+            return [RemainingRow(label: "Mo", remaining: nil, text: "– · ↻–", band: nil)]
+        }
+        let mtd = s.monthToDateCost
+        let left = 100 - budgetFillPercent(monthCost: mtd, budget: codexBudget)
+        let reset = menuBarCountdown(to: startOfNextMonth(after: now), from: now)
+        // Past the budget, "0% left" hides how far past; say the overshoot instead.
+        let text = mtd > codexBudget
+            ? "\(formatCost(mtd - codexBudget)) over · ↻\(reset)"
+            : "\(left)% left · ↻\(reset)"
+        return [RemainingRow(label: "Budget", remaining: left, text: text,
+                             band: budgetBand(monthCost: mtd, budget: codexBudget))]
+    }
+
+    private func remainingColor(_ band: Band?) -> NSColor {
+        switch band {
+        case .ok?, nil:  return NSColor.labelColor.withAlphaComponent(0.55)
+        case .warn?:     return .systemOrange
+        case .critical?: return .systemRed
+        }
+    }
+
+    private func iconColumnW() -> CGFloat {
+        max(measured(Self.claudeIcon, font: Self.iconFont), Self.blossomSize)
+    }
+
+    private func remainingBlockWidth(_ rows: [RemainingRow]) -> CGFloat {
+        let labelW = rows.map { measured($0.label, font: Self.remLabelFont) }.max() ?? 0
+        let textW  = rows.map { measured($0.text, font: Self.percentFont) }.max() ?? 0
+        return iconColumnW() + Self.iconRowGap + labelW + Self.labelBarGap
+            + Self.segTrackW + Self.barTextGap + textW
+    }
+
+    private func remainingPreferredWidth() -> CGFloat {
+        let now = Date()
+        var w = 2 + remainingBlockWidth(claudeRemainingRows(now: now)) + 2
+        if showsCodexColumn {
+            w += Self.sepPad + Self.sepW + Self.sepPad + remainingBlockWidth(codexRemainingRows(now: now))
+        }
+        return w
+    }
+
+    private func drawRemaining() {
+        let now = Date()
+        let midY = bounds.midY
+        var x: CGFloat = 2
+        x = drawRemainingBlock(claudeRemainingRows(now: now), x: x, midY: midY) { center in
+            self.drawClaudeIcon(center: center)
+        }
+        if showsCodexColumn {
+            x = drawSeparator(x: x, midY: midY)
+            drawRemainingBlock(codexRemainingRows(now: now), x: x, midY: midY) { center in
+                self.drawCodexIcon(center: center)
+            }
+        }
+    }
+
+    /// Icon spanning both rows, then one row per limit; a single row sits on the
+    /// centre line so a one-limit block doesn't look half-empty. Returns end x.
+    @discardableResult
+    private func drawRemainingBlock(_ rows: [RemainingRow], x: CGFloat, midY: CGFloat,
+                                    icon: (NSPoint) -> Void) -> CGFloat {
+        let iconW = iconColumnW()
+        icon(NSPoint(x: x + iconW / 2, y: midY))
+        let labelW = rows.map { measured($0.label, font: Self.remLabelFont) }.max() ?? 0
+        let textW  = rows.map { measured($0.text, font: Self.percentFont) }.max() ?? 0
+        let labelX = x + iconW + Self.iconRowGap
+        let barX   = labelX + labelW + Self.labelBarGap
+        let textX  = barX + Self.segTrackW + Self.barTextGap
+
+        let centers: [CGFloat] = rows.count == 1
+            ? [midY]
+            : rows.indices.map { midY + Self.rowOffset - CGFloat($0) * 2 * Self.rowOffset }
+        for (row, cy) in zip(rows, centers) {
+            let lAttrs: [NSAttributedString.Key: Any] = [
+                .font: Self.remLabelFont, .foregroundColor: NSColor.labelColor]
+            let lStr = row.label as NSString
+            let lSize = lStr.size(withAttributes: lAttrs)
+            lStr.draw(at: NSPoint(x: labelX, y: cy - lSize.height / 2), withAttributes: lAttrs)
+
+            let color = remainingColor(row.band)
+            drawSegmentedBar(remaining: row.remaining, color: color, x: barX, centerY: cy)
+
+            // Attention colours carry into the text; neutral rows stay plain.
+            let tint: NSColor = (row.band == .warn || row.band == .critical) ? color : .labelColor
+            let tAttrs: [NSAttributedString.Key: Any] = [.font: Self.percentFont, .foregroundColor: tint]
+            let tStr = row.text as NSString
+            let tSize = tStr.size(withAttributes: tAttrs)
+            tStr.draw(at: NSPoint(x: textX, y: cy - tSize.height / 2), withAttributes: tAttrs)
+        }
+        return textX + textW
+    }
+
+    /// Five segments that drain from the right as capacity is used up; the fill
+    /// is clipped to the segment shapes so partial segments read correctly.
+    private func drawSegmentedBar(remaining: Int?, color: NSColor, x: CGFloat, centerY: CGFloat) {
+        let y = centerY - Self.barH / 2
+        let segments = NSBezierPath()
+        for i in 0..<Self.segCount {
+            let r = NSRect(x: x + CGFloat(i) * (Self.segW + Self.segGap), y: y, width: Self.segW, height: Self.barH)
+            segments.appendRoundedRect(r, xRadius: 1, yRadius: 1)
+        }
+        NSColor.labelColor.withAlphaComponent(0.15).setFill()
+        segments.fill()
+        guard let remaining, remaining > 0 else { return }
+        NSGraphicsContext.saveGraphicsState()
+        segments.addClip()
+        color.setFill()
+        NSRect(x: x, y: y, width: Self.segTrackW * CGFloat(min(100, remaining)) / 100, height: Self.barH).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    /// Claude Code's own spinner glyph — familiar to the people this app is for.
+    private func drawClaudeIcon(center: NSPoint) {
+        let attrs: [NSAttributedString.Key: Any] = [.font: Self.iconFont, .foregroundColor: NSColor.labelColor]
+        let str = Self.claudeIcon as NSString
+        let size = str.size(withAttributes: attrs)
+        str.draw(at: NSPoint(x: center.x - size.width / 2, y: center.y - size.height / 2), withAttributes: attrs)
+    }
+
+    /// Simplified OpenAI blossom: six rounded petals rotated 60° apart. Drawn as
+    /// vector so it stays monochrome and matches the ✻ (no emoji exists for it).
+    private func drawCodexIcon(center: NSPoint) {
+        let size = Self.blossomSize
+        let petalW = size * 0.28
+        let petalH = size * 0.92
+        NSColor.labelColor.setFill()
+        for i in 0..<6 {
+            let rect = NSRect(x: -petalW / 2, y: -petalH / 2, width: petalW, height: petalH)
+            let petal = NSBezierPath(roundedRect: rect, xRadius: petalW / 2, yRadius: petalW / 2)
+            petal.transform(using: AffineTransform(rotationByDegrees: CGFloat(i) * 60))
+            petal.transform(using: AffineTransform(translationByX: center.x, byY: center.y))
+            petal.fill()
+        }
     }
 
     // MARK: - Fill color
