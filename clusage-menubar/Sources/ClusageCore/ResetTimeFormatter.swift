@@ -48,3 +48,22 @@ public func menuDetailTime(
     fmt.setLocalizedDateFormatFromTemplate("EEE j:mm")
     return fmt.string(from: date)
 }
+
+/// Format a reset *date* for the compact menu bar (month/day, e.g. "8/31" in
+/// en_US, "31/8" where day comes first). nil → "–"
+///
+/// WHY a date, not a time: the Codex monthly limit resets days or weeks out, so
+/// a time-of-day would be noise there — unlike the 5h window, where the time is
+/// the whole point. Template "Md" lets the locale pick the day/month order.
+public func menuBarShortDate(
+    _ date: Date?,
+    locale: Locale = .autoupdatingCurrent,
+    timeZone: TimeZone = .current
+) -> String {
+    guard let date else { return "–" }
+    let fmt = DateFormatter()
+    fmt.locale = locale
+    fmt.timeZone = timeZone
+    fmt.setLocalizedDateFormatFromTemplate("Md")
+    return fmt.string(from: date)
+}

@@ -14,7 +14,7 @@ install and development. Read it before working in that directory.
 | Dir | What | Dev commands |
 |---|---|---|
 | `clud/` | iTerm2 Claude HUD panel (Python) | see `clud/README.md` |
-| `clusage-menubar/` | macOS menu bar Claude usage app (Swift 6, AppKit) | `make -C clusage-menubar check` |
+| `clusage-menubar/` | macOS menu bar Claude (+ Codex) usage app (Swift 6, AppKit) | `make -C clusage-menubar check` |
 
 ## Releasing clusage-menubar (fully automated — never release manually)
 - NEVER create `clusage-menubar-v*` tags or GitHub releases by hand, and NEVER edit

@@ -1,9 +1,17 @@
 /// StatusBarView.swift — Stats-style compact usage display for the macOS menu bar.
 ///
-/// Custom NSView subclass that draws a 2×2 grid of usage rows:
+/// Custom NSView subclass that draws a 2-row grid of usage cells:
 ///   Left column:  5H gauge (top)    /  RESETS <time> (bottom)
 ///   Right column: WK gauge  (top)   /  F gauge        (bottom)
+///   Codex column: 1D cost · 7D cost (top) / MO gauge · RST date (bottom)
 /// Columns are separated by a vertical rule. 7pt labels / 9pt monospaced-digit values.
+///
+/// The Codex column only appears when a Codex install is detected (and the user
+/// hasn't hidden it), so Claude-only users see the original two-column layout
+/// unchanged. Claude cells are percent-of-limit gauges; Codex 1D/7D are dollar
+/// estimates (or token counts) because Codex plans expose no 5h/weekly windows.
+/// The MO cell is a real percent-of-limit gauge when ChatGPT reports a monthly
+/// spend control, otherwise a month-to-date $ against the user's budget.
 ///
 /// Rendering is pure NSColor / NSBezierPath so it adapts automatically to light/dark
 /// menu bar appearance (all colors are dynamic NSColor semantics).
@@ -34,6 +42,7 @@ final class StatusBarView: NSView {
     // Horizontal gaps inside a row
     private static let labelBarGap: CGFloat = 3   // label column → bar
     private static let barTextGap: CGFloat  = 3   // bar → percent column
+    private static let cellGap: CGFloat     = 8   // between label/cell pairs in the Codex block
 
     // Vertical separator dimensions
     private static let sepW: CGFloat   = 1
@@ -48,6 +57,26 @@ final class StatusBarView: NSView {
     var snapshot: UsageSnapshot?
     var resetDate: Date?   // session.resetsAt — shown in the bottom-left cell
     var isDegraded = false
+
+    // Codex column state (see CodexScanner / CodexPlanFetcher / CodexDisplayStore)
+    var codexSummary: CodexSummary?
+    /// true → 1D/7D show estimated dollars; false → compact token counts.
+    var codexShowsDollars = true
+    /// Green/yellow boundary for the month-to-date barometer (fallback MO cell).
+    var codexBudget: Double = CodexBudgetStore.defaultBudget
+    /// Monthly spend-control state from ChatGPT; when present the MO cell is a
+    /// true percent-of-limit gauge instead of the $-budget barometer.
+    var codexPlan: CodexPlanUsage?
+    /// The user's "Show in Menu Bar" preference for the Codex column.
+    var codexColumnEnabled = true
+
+    /// The Codex column renders only with the preference on AND some Codex data
+    /// available. codexSummary is nil until the first successful scan and stays
+    /// nil when ~/.codex has no sessions, so Claude-only Macs never grow a
+    /// dashed-out third column.
+    var showsCodexColumn: Bool {
+        codexColumnEnabled && (codexSummary != nil || codexPlan != nil)
+    }
 
     // MARK: - Init
 
@@ -81,7 +110,12 @@ final class StatusBarView: NSView {
     /// Called externally by AppDelegate to set statusItem.length.
     func preferredWidth() -> CGFloat {
         let m = gridMetrics()
-        return 2 + m.leftColW + Self.sepPad + Self.sepW + Self.sepPad + m.rightColW + 2
+        let sepUnit = Self.sepPad + Self.sepW + Self.sepPad
+        var w = 2 + m.leftColW + sepUnit + m.rightColW + 2
+        if showsCodexColumn {
+            w += sepUnit + cellGridWidth(codexGridColumns())
+        }
+        return w
     }
 
     // MARK: - Grid metrics
@@ -97,22 +131,18 @@ final class StatusBarView: NSView {
     private func gridMetrics() -> GridMetrics {
         let e = entriesForDisplay()
 
-        func measuredLabelW(_ s: String) -> CGFloat {
-            ceil((s as NSString).size(withAttributes: [.font: Self.labelFont]).width)
-        }
-        func measuredPctW(_ s: String) -> CGFloat {
-            ceil((s as NSString).size(withAttributes: [.font: Self.percentFont]).width)
-        }
-
-        let leftLabelW  = max(measuredLabelW(e.session.label), measuredLabelW(Self.resetLabel))
-        let rightLabelW = max(measuredLabelW(e.week.label),    measuredLabelW(e.fable.label))
-        let allPctW     = max(measuredPctW(e.session.percentText),
-                          max(measuredPctW(e.fable.percentText), measuredPctW(e.week.percentText)))
+        let leftLabelW  = max(measured(e.session.label, font: Self.labelFont),
+                              measured(Self.resetLabel, font: Self.labelFont))
+        let rightLabelW = max(measured(e.week.label, font: Self.labelFont),
+                              measured(e.fable.label, font: Self.labelFont))
+        let allPctW     = max(measured(e.session.percentText, font: Self.percentFont),
+                          max(measured(e.fable.percentText, font: Self.percentFont),
+                              measured(e.week.percentText, font: Self.percentFont)))
 
         func gaugeRowW(_ lw: CGFloat) -> CGFloat {
             lw + Self.labelBarGap + Self.barW + Self.barTextGap + allPctW
         }
-        let timeStrW = ceil((timeText() as NSString).size(withAttributes: [.font: Self.timeFont]).width)
+        let timeStrW = measured(timeText(), font: Self.timeFont)
         let timeRowW = leftLabelW + Self.labelBarGap + timeStrW
 
         let leftColW  = max(gaugeRowW(leftLabelW), timeRowW)
@@ -127,73 +157,53 @@ final class StatusBarView: NSView {
         )
     }
 
+    private func measured(_ s: String, font: NSFont) -> CGFloat {
+        ceil((s as NSString).size(withAttributes: [.font: font]).width)
+    }
+
     // MARK: - Drawing
 
     override func draw(_ dirtyRect: NSRect) {
         let e = entriesForDisplay()
         let m = gridMetrics()
         let midY = bounds.midY
+        let topY = midY + Self.rowOffset
+        let botY = midY - Self.rowOffset
         let x0: CGFloat = 2
 
-        drawRow(entry: e.session, x: x0, centerY: midY + Self.rowOffset, labelW: m.leftLabelW,  pctW: m.pctW)
-        drawTimeRow(x: x0, centerY: midY - Self.rowOffset, labelW: m.leftLabelW)
+        drawRow(entry: e.session, x: x0, centerY: topY, labelW: m.leftLabelW,  pctW: m.pctW)
+        drawTimeRow(x: x0, centerY: botY, labelW: m.leftLabelW)
 
         let rx = drawSeparator(x: x0 + m.leftColW, midY: midY)
 
-        drawRow(entry: e.week,  x: rx, centerY: midY + Self.rowOffset, labelW: m.rightLabelW, pctW: m.pctW)
-        drawRow(entry: e.fable, x: rx, centerY: midY - Self.rowOffset, labelW: m.rightLabelW, pctW: m.pctW)
+        drawRow(entry: e.week,  x: rx, centerY: topY, labelW: m.rightLabelW, pctW: m.pctW)
+        drawRow(entry: e.fable, x: rx, centerY: botY, labelW: m.rightLabelW, pctW: m.pctW)
+
+        if showsCodexColumn {
+            let cx = drawSeparator(x: rx + m.rightColW, midY: midY)
+            drawCellGrid(codexGridColumns(), x: cx, topY: topY, botY: botY)
+        }
     }
 
     // MARK: - Row drawing
 
     private func drawRow(entry: SegmentEntry, x: CGFloat, centerY: CGFloat, labelW: CGFloat, pctW: CGFloat) {
         // -- Label: right-aligned in its column, vertically centered on the row --
-        let labelAttrs: [NSAttributedString.Key: Any] = [
-            .font: Self.labelFont,
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]
-        let labelStr  = entry.label as NSString
-        let labelSize = labelStr.size(withAttributes: labelAttrs)
-        labelStr.draw(at: NSPoint(x: x + labelW - labelSize.width,
-                                  y: centerY - labelSize.height / 2),
-                      withAttributes: labelAttrs)
+        drawRightAlignedLabel(entry.label, x: x, labelW: labelW, centerY: centerY)
 
         // -- Mini progress bar (track + fill), reusing fillColor(for:) --
-        let barX      = x + labelW + Self.labelBarGap
-        let trackRect = NSRect(x: barX, y: centerY - Self.barH / 2, width: Self.barW, height: Self.barH)
-        NSColor.labelColor.withAlphaComponent(0.15).setFill()
-        NSBezierPath(roundedRect: trackRect, xRadius: Self.barCorner, yRadius: Self.barCorner).fill()
-        let fillW = CGFloat(entry.percent) / 100 * Self.barW
-        if fillW > 0 {
-            let fillRect = NSRect(x: barX, y: centerY - Self.barH / 2, width: fillW, height: Self.barH)
-            fillColor(for: entry.percent).setFill()
-            NSBezierPath(roundedRect: fillRect, xRadius: Self.barCorner, yRadius: Self.barCorner).fill()
-        }
+        let barX = x + labelW + Self.labelBarGap
+        drawMiniBar(percent: entry.percent, color: fillColor(for: entry.percent), x: barX, centerY: centerY)
 
         // -- Percent: right-aligned in its column so digits line up --
-        let pAttrs: [NSAttributedString.Key: Any] = [
-            .font: Self.percentFont,
-            .foregroundColor: NSColor.labelColor,
-        ]
-        let pStr  = entry.percentText as NSString
-        let pSize = pStr.size(withAttributes: pAttrs)
-        pStr.draw(at: NSPoint(x: barX + Self.barW + Self.barTextGap + pctW - pSize.width,
-                              y: centerY - pSize.height / 2),
-                  withAttributes: pAttrs)
+        drawRightAlignedValue(entry.percentText, tint: .labelColor,
+                              rightEdge: barX + Self.barW + Self.barTextGap + pctW, centerY: centerY)
     }
 
     /// Draw the RESETS label and reset-time string in the bottom-left cell.
     private func drawTimeRow(x: CGFloat, centerY: CGFloat, labelW: CGFloat) {
         // "RESETS" — right-aligned in labelW, secondary label color (same style as gauge labels)
-        let labelAttrs: [NSAttributedString.Key: Any] = [
-            .font: Self.labelFont,
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]
-        let rStr  = Self.resetLabel as NSString
-        let rSize = rStr.size(withAttributes: labelAttrs)
-        rStr.draw(at: NSPoint(x: x + labelW - rSize.width,
-                              y: centerY - rSize.height / 2),
-                  withAttributes: labelAttrs)
+        drawRightAlignedLabel(Self.resetLabel, x: x, labelW: labelW, centerY: centerY)
 
         // Reset time — left-aligned after label gap, primary label color
         let timeAttrs: [NSAttributedString.Key: Any] = [
@@ -220,10 +230,153 @@ final class StatusBarView: NSView {
         return x + Self.sepPad + Self.sepW + Self.sepPad
     }
 
+    // MARK: - Drawing primitives (shared by the Claude rows and the Codex block)
+
+    /// 7pt secondary label, right-aligned to x + labelW.
+    private func drawRightAlignedLabel(_ label: String, x: CGFloat, labelW: CGFloat, centerY: CGFloat) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: Self.labelFont,
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        let str  = label as NSString
+        let size = str.size(withAttributes: attrs)
+        str.draw(at: NSPoint(x: x + labelW - size.width, y: centerY - size.height / 2),
+                 withAttributes: attrs)
+    }
+
+    /// 9pt monospaced-digit value, right-aligned to rightEdge so digits line up.
+    private func drawRightAlignedValue(_ value: String, tint: NSColor, rightEdge: CGFloat, centerY: CGFloat) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: Self.percentFont,
+            .foregroundColor: tint,
+        ]
+        let str  = value as NSString
+        let size = str.size(withAttributes: attrs)
+        str.draw(at: NSPoint(x: rightEdge - size.width, y: centerY - size.height / 2),
+                 withAttributes: attrs)
+    }
+
+    /// Horizontal mini gauge (track + fill) starting at x.
+    private func drawMiniBar(percent: Int, color: NSColor, x: CGFloat, centerY: CGFloat) {
+        let trackRect = NSRect(x: x, y: centerY - Self.barH / 2, width: Self.barW, height: Self.barH)
+        NSColor.labelColor.withAlphaComponent(0.15).setFill()
+        NSBezierPath(roundedRect: trackRect, xRadius: Self.barCorner, yRadius: Self.barCorner).fill()
+        let fillW = CGFloat(percent) / 100 * Self.barW
+        if fillW > 0 {
+            let fillRect = NSRect(x: x, y: centerY - Self.barH / 2, width: fillW, height: Self.barH)
+            color.setFill()
+            NSBezierPath(roundedRect: fillRect, xRadius: Self.barCorner, yRadius: Self.barCorner).fill()
+        }
+    }
+
+    // MARK: - Codex block: a 2-row cell grid
+    //
+    //   1D $16.2   7D $30.1
+    //   MO ▓▓░ 84%  RST 8/31
+    //
+    // A column = one label + one cell per row. Label widths and content widths
+    // are shared across both rows, so labels right-align to a common edge and
+    // values right-align so digits line up — the same discipline as the Claude
+    // columns, expressed as data so the block can vary (RST only with a real limit).
+
+    /// One cell: a gauge (bar left, value right) or a plain value (right-aligned).
+    private enum GridCell {
+        case gauge(percent: Int, text: String, color: NSColor)
+        case text(String, tint: NSColor)
+        case empty
+    }
+
+    private struct GridColumn {
+        let topLabel: String
+        let bottomLabel: String
+        let top: GridCell
+        let bottom: GridCell
+    }
+
+    private func cellContentW(_ cell: GridCell) -> CGFloat {
+        switch cell {
+        case .gauge(_, let text, _):
+            return Self.barW + Self.barTextGap + measured(text, font: Self.percentFont)
+        case .text(let value, _):
+            return measured(value, font: Self.percentFont)
+        case .empty:
+            return 0
+        }
+    }
+
+    private func cellGridMetrics(_ cols: [GridColumn]) -> [(labelW: CGFloat, contentW: CGFloat)] {
+        cols.map { col in
+            (labelW: max(measured(col.topLabel, font: Self.labelFont),
+                         measured(col.bottomLabel, font: Self.labelFont)),
+             contentW: max(cellContentW(col.top), cellContentW(col.bottom)))
+        }
+    }
+
+    private func cellGridWidth(_ cols: [GridColumn]) -> CGFloat {
+        let metrics = cellGridMetrics(cols)
+        var w: CGFloat = 0
+        for (i, m) in metrics.enumerated() {
+            w += m.labelW + Self.labelBarGap + m.contentW
+            if i < metrics.count - 1 { w += Self.cellGap }
+        }
+        return w
+    }
+
+    private func drawCell(_ cell: GridCell, x: CGFloat, contentW: CGFloat, centerY: CGFloat) {
+        switch cell {
+        case .gauge(let percent, let text, let color):
+            drawMiniBar(percent: percent, color: color, x: x, centerY: centerY)
+            drawRightAlignedValue(text, tint: .labelColor, rightEdge: x + contentW, centerY: centerY)
+        case .text(let value, let tint):
+            drawRightAlignedValue(value, tint: tint, rightEdge: x + contentW, centerY: centerY)
+        case .empty:
+            break
+        }
+    }
+
+    /// Draw a cell grid starting at x; returns the x after the grid.
+    @discardableResult
+    private func drawCellGrid(_ cols: [GridColumn], x: CGFloat, topY: CGFloat, botY: CGFloat) -> CGFloat {
+        let metrics = cellGridMetrics(cols)
+        var cx = x
+        for i in 0..<cols.count {
+            let m = metrics[i]
+            if case .empty = cols[i].top {} else {
+                drawRightAlignedLabel(cols[i].topLabel, x: cx, labelW: m.labelW, centerY: topY)
+            }
+            if case .empty = cols[i].bottom {} else {
+                drawRightAlignedLabel(cols[i].bottomLabel, x: cx, labelW: m.labelW, centerY: botY)
+            }
+            let contentX = cx + m.labelW + Self.labelBarGap
+            drawCell(cols[i].top, x: contentX, contentW: m.contentW, centerY: topY)
+            drawCell(cols[i].bottom, x: contentX, contentW: m.contentW, centerY: botY)
+            cx = contentX + m.contentW + Self.cellGap
+        }
+        return cx - Self.cellGap
+    }
+
+    /// The Codex 2×2 block: 1D/MO on the left, 7D/RST on the right. RST (the
+    /// monthly reset date) only exists when ChatGPT reports a real limit.
+    private func codexGridColumns() -> [GridColumn] {
+        let c = codexDisplay()
+        return [
+            GridColumn(topLabel: "1D", bottomLabel: "MO",
+                       top: .text(c.day, tint: .labelColor),
+                       bottom: .gauge(percent: c.monthPercent, text: c.month, color: c.monthColor)),
+            GridColumn(topLabel: "7D", bottomLabel: c.monthReset != nil ? "RST" : "",
+                       top: .text(c.week, tint: .labelColor),
+                       bottom: c.monthReset.map { .text($0, tint: .labelColor) } ?? .empty),
+        ]
+    }
+
     // MARK: - Fill color
 
     private func fillColor(for percent: Int) -> NSColor {
-        switch band(forPercent: percent) {
+        color(for: band(forPercent: percent))
+    }
+
+    private func color(for band: Band) -> NSColor {
+        switch band {
         case .ok:       return .systemGreen
         case .warn:     return .systemYellow
         case .critical: return .systemRed
@@ -263,6 +416,56 @@ final class StatusBarView: NSView {
     private func timeText() -> String {
         if isDegraded { return "–:–" }
         return menuBarTime(resetDate)
+    }
+
+    /// Codex cell values; dashes when the scan hasn't produced a summary yet.
+    private struct CodexDisplay {
+        let day: String
+        let week: String
+        let month: String
+        let monthPercent: Int
+        let monthColor: NSColor
+        /// Short monthly-reset date ("8/31") — only when the real spend-control
+        /// limit is reported; nil drops the RST cell.
+        let monthReset: String?
+    }
+
+    private func codexDisplay() -> CodexDisplay {
+        // MO cell: prefer the real monthly limit percent (ChatGPT spend control,
+        // standard limit bands); fall back to the local $-budget barometer.
+        let month: String
+        let monthPercent: Int
+        let monthColor: NSColor
+        let monthReset: String?
+        if let plan = codexPlan {
+            month = "\(plan.usedPercent)%"
+            monthPercent = plan.usedPercent
+            monthColor = fillColor(for: plan.usedPercent)
+            monthReset = menuBarShortDate(plan.resetsAt)
+        } else if let s = codexSummary {
+            let mtd = s.monthToDateCost
+            month = codexShowsDollars ? formatCost(mtd) : formatTokens(s.monthToDateTotal)
+            monthPercent = budgetFillPercent(monthCost: mtd, budget: codexBudget)
+            monthColor = color(for: budgetBand(monthCost: mtd, budget: codexBudget))
+            monthReset = nil
+        } else {
+            month = "–"
+            monthPercent = 0
+            monthColor = .labelColor
+            monthReset = nil
+        }
+
+        guard let s = codexSummary else {
+            return CodexDisplay(day: "–", week: "–", month: month,
+                                monthPercent: monthPercent, monthColor: monthColor,
+                                monthReset: monthReset)
+        }
+        return CodexDisplay(
+            day:  codexShowsDollars ? formatCost(s.todayCost)     : formatTokens(s.todayTotal),
+            week: codexShowsDollars ? formatCost(s.last7DaysCost) : formatTokens(s.last7DaysTotal),
+            month: month,
+            monthPercent: monthPercent, monthColor: monthColor,
+            monthReset: monthReset)
     }
 
 }

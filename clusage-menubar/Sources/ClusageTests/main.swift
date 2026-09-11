@@ -230,6 +230,224 @@ func testRefreshIntervalNormalize() {
     expectEqual(RefreshInterval.defaultMinutes, 5, "default stays the historical 5-min cadence")
 }
 
+// MARK: - Tests: Codex session-log parsing
+
+/// Real `token_count` line captured 2026-08-26 from ~/.codex/sessions.
+let codexTokenCountLine = """
+{"timestamp":"2026-08-26T19:34:25.107Z","ordinal":23,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":65477,"cached_input_tokens":46592,"cache_write_input_tokens":0,"output_tokens":317,"reasoning_output_tokens":64,"total_tokens":65794},"last_token_usage":{"input_tokens":33183,"cached_input_tokens":31488,"cache_write_input_tokens":0,"output_tokens":118,"reasoning_output_tokens":18,"total_tokens":33301},"model_context_window":258400},"rate_limits":{"limit_id":"codex","primary":null,"secondary":null}}}
+"""
+
+func testParseCodexTokenCountLine() {
+    guard let turn = parseCodexTokenCountLine(codexTokenCountLine) else {
+        expect(false, "codex: real token_count line should parse")
+        return
+    }
+    expectEqual(turn.inputTokens, 33183, "codex: input from last_token_usage (per-turn delta, not cumulative)")
+    expectEqual(turn.cachedInputTokens, 31488, "codex: cached input")
+    expectEqual(turn.outputTokens, 118, "codex: output")
+    expectEqual(turn.totalTokens, 33301, "codex: total")
+    var utc = Calendar(identifier: .gregorian)
+    utc.timeZone = TimeZone(identifier: "UTC")!
+    expectEqual(utc.component(.hour, from: turn.timestamp), 19, "codex: timestamp parsed with fractional seconds")
+
+    expect(parseCodexTokenCountLine("{\"type\":\"session_meta\",\"payload\":{}}") == nil,
+           "codex: non-token_count line returns nil")
+    expect(parseCodexTokenCountLine("{not json") == nil, "codex: malformed JSON returns nil")
+    expect(parseCodexTokenCountLine(
+        "{\"timestamp\":\"2026-08-26T19:34:25.107Z\",\"payload\":{\"type\":\"token_count\",\"info\":null}}") == nil,
+           "codex: token_count with null info returns nil")
+
+    let noFraction = """
+    {"timestamp":"2026-08-26T19:34:25Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"total_tokens":15}}}}
+    """
+    expectEqual(parseCodexTokenCountLine(noFraction)?.totalTokens, 15,
+                "codex: timestamp without fractional seconds still parses")
+}
+
+func testParseCodexModelAndLimitLines() {
+    let turnContextLine = """
+    {"timestamp":"2026-08-26T19:50:02.480Z","type":"turn_context","payload":{"turn_id":"x","cwd":"/tmp","model":"gpt-5.6-luna","approval_policy":"never"}}
+    """
+    expectEqual(parseCodexModelLine(turnContextLine), "gpt-5.6-luna", "codex: model from turn_context")
+    expect(parseCodexModelLine(codexTokenCountLine) == nil, "codex: token_count line yields no model")
+
+    let sessionMetaLine = """
+    {"timestamp":"2026-08-26T09:26:33.000Z","type":"session_meta","payload":{"session_id":"x","base_instructions":{"text":"...","provenance":{"model":"gpt-5.6-luna"}}}}
+    """
+    expectEqual(parseCodexModelLine(sessionMetaLine), "gpt-5.6-luna",
+                "codex: model from session_meta base_instructions.provenance (ambient sessions)")
+
+    let healthy = """
+    {"timestamp":"2026-08-26T19:34:25.107Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":1}},"rate_limits":{"limit_id":"codex","primary":null,"secondary":null,"credits":{"has_credits":true,"unlimited":false,"balance":null},"spend_control_reached":null,"plan_type":"business","rate_limit_reached_type":null}}}
+    """
+    if let limit = parseCodexLimitStatus(healthy) {
+        expectEqual(limit.planType, "business", "codex: plan type parsed")
+        expectEqual(limit.hasCredits, true, "codex: has_credits parsed")
+        expect(limit.creditBalance == nil, "codex: null balance stays nil")
+        expect(!limit.isLimited, "codex: healthy status is not limited")
+    } else {
+        expect(false, "codex: limit status parses from real-shaped rate_limits")
+    }
+
+    let limited = """
+    {"timestamp":"2026-08-26T19:34:25.107Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"credits":{"has_credits":false},"spend_control_reached":true,"rate_limit_reached_type":"credits_exhausted","primary":{"used_percent":97.6}}}}
+    """
+    if let status = parseCodexLimitStatus(limited) {
+        expect(status.isLimited, "codex: spend control / exhausted credits flag as limited")
+        expectEqual(status.primaryUsedPercent, 98, "codex: primary used_percent rounded")
+    } else {
+        expect(false, "codex: limited status parses")
+    }
+}
+
+// MARK: - Tests: Codex aggregation + pricing
+
+/// Fixed clock for the window tests: 2026-08-26 14:00 in America/Denver.
+func codexTestCalendar() -> (cal: Calendar, now: Date) {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "America/Denver")!
+    let now = cal.date(from: DateComponents(year: 2026, month: 8, day: 26, hour: 14))!
+    return (cal, now)
+}
+
+func testAggregateCodexUsage() {
+    let (cal, now) = codexTestCalendar()
+    func turn(daysAgo: Int, hour: Int, total: Int, output: Int) -> CodexTurn {
+        let day = cal.date(byAdding: .day, value: -daysAgo, to: cal.startOfDay(for: now))!
+        let ts = cal.date(byAdding: .hour, value: hour, to: day)!
+        return CodexTurn(timestamp: ts, inputTokens: total - output, cachedInputTokens: 0,
+                         outputTokens: output, totalTokens: total)
+    }
+
+    let sessions: [String: [CodexTurn]] = [
+        "a.jsonl": [turn(daysAgo: 0, hour: 9, total: 1000, output: 100),
+                    turn(daysAgo: 0, hour: 10, total: 2000, output: 200)],
+        "b.jsonl": [turn(daysAgo: 3, hour: 12, total: 5000, output: 500)],
+        "c.jsonl": [turn(daysAgo: 6, hour: 8, total: 700, output: 70)],    // oldest in-7d-window day
+        "d.jsonl": [turn(daysAgo: 7, hour: 8, total: 9999, output: 999)],  // outside 7d, inside 30d
+        "e.jsonl": [turn(daysAgo: 27, hour: 8, total: 111, output: 11)],   // Jul 30: inside 30d, before month start
+        "f.jsonl": [turn(daysAgo: 40, hour: 8, total: 5555, output: 55)],  // outside every window
+    ]
+
+    let summary = aggregateCodexUsage(turnsBySession: sessions, now: now, calendar: cal)
+    expectEqual(summary.todayTotal, 3000, "codex agg: today sums both turns of session a")
+    expectEqual(summary.todayOutput, 300, "codex agg: today output")
+    expectEqual(summary.last7DaysTotal, 8700, "codex agg: 7-day window includes day-6, excludes day-7")
+    expectEqual(summary.last7DaysOutput, 870, "codex agg: 7-day output")
+    expectEqual(summary.last30DaysTotal, 18810, "codex agg: 30-day window adds day-7 and day-27, excludes day-40")
+    // now = Aug 26 → month starts Aug 1: excludes day-27 (Jul 30) but includes day-7 (Aug 19).
+    expectEqual(summary.monthToDateTotal, 18699, "codex agg: month-to-date starts at calendar month start")
+    expectEqual(summary.sessionsToday, 1, "codex agg: only session a active today")
+    expectEqual(summary.lastActivity, sessions["a.jsonl"]![1].timestamp, "codex agg: lastActivity is newest turn")
+
+    let empty = aggregateCodexUsage(turnsBySession: [:], now: now, calendar: cal)
+    expectEqual(empty.todayTotal, 0, "codex agg: empty input → zero totals")
+    expect(empty.lastActivity == nil, "codex agg: empty input → nil lastActivity")
+}
+
+func testCodexPricing() {
+    let (cal, now) = codexTestCalendar()
+
+    expectEqual(codexPricing(forModel: "gpt-5.6-luna").output, 1.20, "codex pricing: exact table hit")
+    expectEqual(codexPricing(forModel: "gpt-5.6-luna-2026-09-01").output, 1.20, "codex pricing: prefix match on dated variant")
+    expectEqual(codexPricing(forModel: "codex-auto-review"), codexFallbackPricing, "codex pricing: unknown model → fallback")
+    expectEqual(codexPricing(forModel: nil), codexFallbackPricing, "codex pricing: nil model → fallback")
+    expectEqual(codexPricing(forModel: "gpt-5.4-mini").output, 4.50, "codex pricing: gpt-5.4-mini in table")
+    expectEqual(codexPricing(forModel: "gpt-6-astra").output, 50.00, "codex pricing: gpt-6-astra in table")
+
+    // 1M uncached input + 1M cached + 1M output on luna: 0.20 + 0.02 + 1.20 = 1.42
+    let lunaTurn = CodexTurn(timestamp: now, inputTokens: 2_000_000, cachedInputTokens: 1_000_000,
+                             outputTokens: 1_000_000, totalTokens: 3_000_000, model: "gpt-5.6-luna")
+    expect(abs(costOfCodexTurn(lunaTurn) - 1.42) < 0.0001, "codex cost: luna uncached/cached/output split")
+
+    let solTurn = CodexTurn(timestamp: now, inputTokens: 500_000, cachedInputTokens: 0,
+                            outputTokens: 100_000, totalTokens: 600_000, model: "gpt-5.6-sol")
+    expect(abs(costOfCodexTurn(solTurn) - 4.0) < 0.0001, "codex cost: sol (0.5M×$4 + 0.1M×$20 = $4)")
+
+    let degenTurn = CodexTurn(timestamp: now, inputTokens: 0, cachedInputTokens: 0,
+                              outputTokens: 0, totalTokens: 1_000_000, model: "gpt-5.6-luna")
+    expect(abs(costOfCodexTurn(degenTurn) - 0.20) < 0.0001,
+           "codex cost: component-less total priced at input rate (ambient sessions)")
+
+    let costSummary = aggregateCodexUsage(turnsBySession: ["s.jsonl": [lunaTurn, solTurn]], now: now, calendar: cal)
+    expect(abs(costSummary.todayCost - 5.42) < 0.0001, "codex cost: aggregate today cost sums turns")
+    expectEqual(costSummary.perModel.count, 2, "codex cost: per-model breakdown has both models")
+    expectEqual(costSummary.perModel.first?.model, "gpt-5.6-sol", "codex cost: per-model sorted by cost desc")
+}
+
+func testBudgetBarometer() {
+    expectEqual(budgetBand(monthCost: 79, budget: 100), .ok, "budget: under budget → green")
+    expectEqual(budgetBand(monthCost: 100, budget: 100), .ok, "budget: at budget → green")
+    expectEqual(budgetBand(monthCost: 150, budget: 100), .warn, "budget: 1-2x budget → yellow")
+    expectEqual(budgetBand(monthCost: 201, budget: 100), .critical, "budget: over 2x budget → red")
+    expectEqual(budgetBand(monthCost: 999, budget: 0), .ok, "budget: zero budget never alarms")
+    expectEqual(budgetFillPercent(monthCost: 79, budget: 100), 79, "budget: fill percent = cost/budget")
+    expectEqual(budgetFillPercent(monthCost: 250, budget: 100), 100, "budget: fill capped at 100")
+}
+
+func testFormatCostAndTokens() {
+    expectEqual(formatCost(0), "$0.00", "formatCost: zero")
+    expectEqual(formatCost(3.456), "$3.46", "formatCost: under $10 two decimals")
+    expectEqual(formatCost(12.34), "$12.3", "formatCost: under $100 one decimal")
+    expectEqual(formatCost(123.4), "$123", "formatCost: over $100 whole dollars")
+
+    expectEqual(formatTokens(0), "0", "formatTokens: zero")
+    expectEqual(formatTokens(950), "950", "formatTokens: sub-thousand stays raw")
+    expectEqual(formatTokens(1_500), "1.5K", "formatTokens: thousands one decimal")
+    expectEqual(formatTokens(12_345), "12.3K", "formatTokens: tens of thousands")
+    expectEqual(formatTokens(123_456), "123K", "formatTokens: hundreds of thousands drop decimal")
+    expectEqual(formatTokens(3_456_789), "3.5M", "formatTokens: millions")
+    expectEqual(formatTokens(21_000_000), "21M", "formatTokens: trailing .0 dropped")
+    expectEqual(formatTokens(1_234_567_890), "1.2B", "formatTokens: billions")
+    expectEqual(formatTokensLong(3_456_789), "3,456,789", "formatTokensLong: grouped")
+}
+
+// MARK: - Tests: Codex plan usage (ChatGPT spend control)
+
+func testCodexPlanUsageParse() {
+    let whamBody = """
+    {"user_id":"user-x","plan_type":"business","rate_limit":null,
+     "credits":{"has_credits":true,"unlimited":false,"balance":null},
+     "spend_control":{"reached":false,"individual_limit":{
+       "source":"workspace_spend_controls",
+       "limit":"4300","used":"3604.349905371666","remaining":"695.650094628334",
+       "used_percent":84,"remaining_percent":16,
+       "reset_after_seconds":380033,"reset_at":1788220801}}}
+    """.data(using: .utf8)!
+    if let plan = CodexPlanUsage.parse(whamBody) {
+        expectEqual(plan.usedPercent, 84, "plan: used_percent parsed")
+        expect(abs(plan.limitCredits - 4300) < 0.001, "plan: string limit parsed to Double")
+        expect(abs(plan.usedCredits - 3604.3499) < 0.001, "plan: string used parsed")
+        expect(abs(plan.remainingCredits - 695.6501) < 0.001, "plan: string remaining parsed")
+        expectEqual(plan.resetsAt, Date(timeIntervalSince1970: 1788220801), "plan: reset_at epoch parsed")
+        expect(!plan.reached, "plan: reached false")
+    } else {
+        expect(false, "plan: real wham/usage body parses")
+    }
+
+    expect(CodexPlanUsage.parse("{\"plan_type\":\"business\",\"spend_control\":null}".data(using: .utf8)!) == nil,
+           "plan: null spend_control → nil (fall back to budget)")
+    expect(CodexPlanUsage.parse("{}".data(using: .utf8)!) == nil, "plan: empty body → nil")
+
+    let numericBody = """
+    {"spend_control":{"reached":true,"individual_limit":{"limit":100,"used":100}}}
+    """.data(using: .utf8)!
+    if let capped = CodexPlanUsage.parse(numericBody) {
+        expectEqual(capped.usedPercent, 100, "plan: percent derived when used_percent absent")
+        expect(capped.reached, "plan: reached true propagates")
+    } else {
+        expect(false, "plan: numeric credits also parse")
+    }
+}
+
+func testMenuBarShortDate() {
+    let (cal, _) = codexTestCalendar()
+    let resetDate = cal.date(from: DateComponents(year: 2026, month: 8, day: 31))!
+    expectEqual(menuBarShortDate(resetDate, locale: Locale(identifier: "en_US"), timeZone: cal.timeZone),
+                "8/31", "menuBarShortDate: en_US month/day")
+    expectEqual(menuBarShortDate(nil), "–", "menuBarShortDate: nil date dashes")
+}
+
 // MARK: - Run all tests
 
 print("Running ClusageTests…")
@@ -244,6 +462,14 @@ testMenuBarTime()
 testBand()
 testMenuBarShortLabel()
 testRefreshIntervalNormalize()
+testParseCodexTokenCountLine()
+testParseCodexModelAndLimitLines()
+testAggregateCodexUsage()
+testCodexPricing()
+testBudgetBarometer()
+testFormatCostAndTokens()
+testCodexPlanUsageParse()
+testMenuBarShortDate()
 
 if failures == 0 {
     print("OK — all tests passed")
