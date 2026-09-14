@@ -1,9 +1,14 @@
 /// CodexScanner.swift — filesystem scan of Codex CLI session logs.
 ///
 /// Scans ~/.codex/sessions (and ~/.codex/archived_sessions when present) for
-/// rollout-*.jsonl files modified within the aggregation window, extracts
-/// `turn_context` (model) and `token_count` (tokens, rate limits) event lines,
-/// and hands the pure aggregation to ClusageCore.
+/// .jsonl files modified within the aggregation window — Codex names them
+/// rollout-<date>-<uuid>.jsonl today, but the loop takes any .jsonl so a naming
+/// change can't silently zero the numbers — extracts `turn_context` (model) and
+/// `token_count` (tokens, rate limits) event lines, and hands the pure
+/// aggregation to ClusageCore.
+///
+/// Archiving MOVES files (verified: zero basename overlap between the two roots),
+/// so scanning both cannot double-count a session.
 ///
 /// WHY mtime pre-filter: hundreds of historical session files accumulate; only
 /// files touched within the last 32 days can contribute to the month windows,
@@ -51,15 +56,25 @@ final class CodexScanner: @unchecked Sendable {
     private let lock = NSLock()
     private var cache: [String: CacheEntry] = [:]
     private var cacheLoaded = false
+    /// Set when a scan inserts or prunes an entry. In the steady state (every
+    /// file a cache hit, nothing aged out) the cache is unchanged, and rewriting
+    /// it would mean JSON-encoding and atomically replacing megabytes on every
+    /// refresh — as often as once a minute — for no benefit.
+    private var cacheDirty = false
 
     // MARK: - Disk persistence
 
-    private static func cacheFileURL() -> URL? {
+    /// WHY `creatingDirectory` is opt-in: reads must not create the directory.
+    /// Otherwise a Claude-only Mac — which never scans anything — still grows an
+    /// Application Support folder the pre-Codex app never touched.
+    private static func cacheFileURL(creatingDirectory: Bool = false) -> URL? {
         guard let base = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask).first
         else { return nil }
         let dir = base.appendingPathComponent("Clusage", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if creatingDirectory {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
         return dir.appendingPathComponent("codex-scan-cache-v1.json")
     }
 
@@ -77,9 +92,12 @@ final class CodexScanner: @unchecked Sendable {
 
     private func persistCache() {
         lock.lock()
+        let dirty = cacheDirty
         let snapshot = cache
+        if dirty { cacheDirty = false }
         lock.unlock()
-        guard let url = Self.cacheFileURL(),
+        guard dirty else { return }
+        guard let url = Self.cacheFileURL(creatingDirectory: true),
               let data = try? JSONEncoder().encode(snapshot)
         else { return }
         try? data.write(to: url, options: .atomic)
@@ -161,7 +179,9 @@ final class CodexScanner: @unchecked Sendable {
 
         // Drop cache entries for files that aged out of the window or were deleted.
         lock.lock()
+        let before = cache.count
         cache = cache.filter { seenPaths.contains($0.key) }
+        if cache.count != before { cacheDirty = true }
         lock.unlock()
         persistCache()
 
@@ -184,41 +204,91 @@ final class CodexScanner: @unchecked Sendable {
         let parsed = Self.parseFile(at: url)
         lock.lock()
         cache[url.path] = CacheEntry(mtime: mtime, size: size, parsed: parsed)
+        cacheDirty = true
         lock.unlock()
         return parsed
     }
 
+    // The three line markers, as UTF-8 bytes. See byteSearch below for why.
+    private static let turnContextMarker = Array(#""turn_context""#.utf8)
+    private static let sessionMetaMarker = Array(#""session_meta""#.utf8)
+    private static let tokenCountMarker  = Array(#""token_count""#.utf8)
+
     /// Extract turns (model-attributed) and the newest limit flags from one session
-    /// file. Unreadable files contribute nothing — a live session's partially-written
-    /// last line is expected and harmless.
+    /// file.
+    ///
+    /// WHY bytes rather than String line-by-line: the interesting lines are a
+    /// small fraction of a session file, so the pre-filter runs over everything
+    /// and dominates the scan. `String.contains` is grapheme-aware (Unicode
+    /// canonical equivalence) and was measured at ~9.7 s per pattern over 200k
+    /// lines; comparing UTF-8 code units directly does the same job roughly 11x
+    /// faster. The markers are ASCII JSON keys, so byte equality is exact.
+    ///
+    /// Decoding per line also contains damage: a String(contentsOf:) of the whole
+    /// file is all-or-nothing, so one invalid byte — including a half-written
+    /// multi-byte character at the tail of the file Codex is actively appending
+    /// to — discarded every turn in it, and that empty result was then cached
+    /// under the current (mtime, size) until the file changed again. Now only the
+    /// offending line is skipped, which is what the "partially-written last line
+    /// is expected and harmless" promise always meant.
     private static func parseFile(at url: URL) -> ParsedFile {
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else {
+        // .mappedIfSafe avoids copying hundreds of MB. Safe here because session
+        // files are append-only: they grow and are moved, never truncated.
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
             return ParsedFile(turns: [], limitStatus: nil, limitStatusAt: nil)
         }
         var turns: [CodexTurn] = []
         var currentModel: String?
         var limitStatus: CodexLimitStatus?
         var limitStatusAt: Date?
-        content.enumerateLines { line, _ in
-            // Cheap substring pre-filters before JSON parsing; the interesting
-            // lines are a small fraction of a session file. session_meta seeds
-            // the model for ambient sessions that never write a turn_context.
-            if line.contains("\"turn_context\"") || line.contains("\"session_meta\"") {
-                if let model = parseCodexModelLine(line) {
-                    currentModel = model
-                }
-                return
+
+        for lineBytes in data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true) {
+            let isModelLine = byteSearch(lineBytes, turnContextMarker)
+                || byteSearch(lineBytes, sessionMetaMarker)
+            let isTokenLine = !isModelLine && byteSearch(lineBytes, tokenCountMarker)
+            guard isModelLine || isTokenLine else { continue }
+            // Only matching lines are turned into Strings; an undecodable one is
+            // skipped on its own.
+            guard let line = String(data: Data(lineBytes), encoding: .utf8) else { continue }
+
+            if isModelLine {
+                // session_meta seeds the model for ambient sessions that never
+                // write a turn_context.
+                if let model = parseCodexModelLine(line) { currentModel = model }
+                continue
             }
-            guard line.contains("\"token_count\"") else { return }
-            if let turn = parseCodexTokenCountLine(line, model: currentModel) {
-                turns.append(turn)
+            // One JSON decode yields both halves, and the limit status is read
+            // even when the line carries no turn (a limits-only token_count event
+            // has payload.info null but still reports spend_control_reached).
+            guard let parsed = parseCodexLine(line, model: currentModel) else { continue }
+            if let turn = parsed.turn { turns.append(turn) }
+            if let status = parsed.limitStatus {
                 // Lines are chronological, so the last parsed status wins.
-                if let status = parseCodexLimitStatus(line) {
-                    limitStatus = status
-                    limitStatusAt = turn.timestamp
-                }
+                limitStatus = status
+                limitStatusAt = parsed.turn?.timestamp ?? limitStatusAt
             }
         }
         return ParsedFile(turns: turns, limitStatus: limitStatus, limitStatusAt: limitStatusAt)
+    }
+
+    /// Naive UTF-8 substring search over a Data slice.
+    private static func byteSearch(_ haystack: Data, _ needle: [UInt8]) -> Bool {
+        let n = needle.count
+        guard n > 0, haystack.count >= n else { return false }
+        return haystack.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            let first = needle[0]
+            var i = 0
+            let last = raw.count - n
+            while i <= last {
+                if base[i] == first {
+                    var j = 1
+                    while j < n, base[i + j] == needle[j] { j += 1 }
+                    if j == n { return true }
+                }
+                i += 1
+            }
+            return false
+        }
     }
 }

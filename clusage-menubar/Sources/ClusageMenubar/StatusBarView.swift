@@ -75,6 +75,9 @@ final class StatusBarView: NSView {
     var codexPlan: CodexPlanUsage?
     /// Which providers the user wants shown (ProviderVisibilityStore).
     var visibility: ProviderVisibility = .both
+    /// Reference "now" for countdown text, set by AppDelegate once per repaint so
+    /// measurement and drawing cannot straddle a minute boundary.
+    var renderDate = Date()
     /// Which layout to draw (MenuBarStyleStore). AppDelegate repaints every
     /// minute in .remaining so the countdowns stay current.
     var style: MenuBarStyle = .grid
@@ -458,10 +461,18 @@ final class StatusBarView: NSView {
         var rows = [remainingRow(label: "5h", bucket: snap.session, now: now)]
         // Only surface the model-scoped week when it's what will actually stop
         // you first; otherwise the all-models week is the one that matters.
-        if let scoped = snap.weeklyScoped, let all = snap.weeklyAll, scoped.percent > all.percent {
-            rows.append(remainingRow(label: "Wk(\(menuBarShortLabel(scoped.label)))", bucket: scoped, now: now))
-        } else {
-            rows.append(remainingRow(label: "Wk", bucket: snap.weeklyAll ?? snap.weeklyScoped, now: now))
+        // Either way the label names which bucket is on screen — a scoped bucket
+        // shown as a bare "Wk" would overstate how much of the week is left.
+        func scopedLabel(_ b: Bucket) -> String { "Wk(\(menuBarShortLabel(b.label)))" }
+        switch (snap.weeklyAll, snap.weeklyScoped) {
+        case let (all?, scoped?) where scoped.percent > all.percent:
+            rows.append(remainingRow(label: scopedLabel(scoped), bucket: scoped, now: now))
+        case let (all?, _):
+            rows.append(remainingRow(label: "Wk", bucket: all, now: now))
+        case let (nil, scoped?):
+            rows.append(remainingRow(label: scopedLabel(scoped), bucket: scoped, now: now))
+        case (nil, nil):
+            rows.append(remainingRow(label: "Wk", bucket: nil, now: now))
         }
         return rows
     }
@@ -507,7 +518,7 @@ final class StatusBarView: NSView {
     }
 
     private func remainingPreferredWidth() -> CGFloat {
-        let now = Date()
+        let now = renderDate
         var w: CGFloat = 4   // 2pt inset on each side
         if showsClaudeColumn {
             w += remainingBlockWidth(claudeRemainingRows(now: now))
@@ -518,7 +529,7 @@ final class StatusBarView: NSView {
     }
 
     private func drawRemaining() {
-        let now = Date()
+        let now = renderDate
         let midY = bounds.midY
         var x: CGFloat = 2
         if showsClaudeColumn {

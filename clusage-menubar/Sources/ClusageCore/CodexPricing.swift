@@ -8,6 +8,13 @@
 ///
 /// Rates source: developers.openai.com/api/docs/pricing (standard tier,
 /// checked 2026-09-11). Update the table when prices move.
+///
+/// KNOWN GAPS, both of which under-report cost on heavy sessions:
+///   - gpt-5.6-sol's $4.00/$20.00 is promotional through 2026-11-21; it reverts
+///     after that date and this table will need the new rates.
+///   - Requests over 272K input tokens reprice the whole request (2x input,
+///     1.5x output) and that is not modelled here, so long agent sessions —
+///     which resend full context every turn — read low.
 
 import Foundation
 
@@ -42,13 +49,19 @@ public let codexPricingTable: [String: CodexModelPricing] = [
 /// middle-of-the-road guess rather than best- or worst-case.
 public let codexFallbackPricing = CodexModelPricing(input: 2.00, cachedInput: 0.20, output: 12.00)
 
-/// Resolve pricing for a model name: exact match, then prefix match (handles
-/// dated/suffixed variants like "gpt-5.6-luna-2026-08-01"), then fallback.
+/// Resolve pricing for a model name: exact match, then LONGEST prefix match
+/// (handles dated/suffixed variants like "gpt-5.6-luna-2026-08-01"), then fallback.
+///
+/// WHY longest match rather than first match: "gpt-5.4-mini-2026-08-01" prefixes
+/// both "gpt-5.4-mini" and "gpt-5.4", and Dictionary iteration order is
+/// randomized per process — a first-match scan priced the same model at $0.75 or
+/// $2.50 per 1M input depending on the launch.
 public func codexPricing(forModel model: String?) -> CodexModelPricing {
     guard let model, !model.isEmpty else { return codexFallbackPricing }
     if let exact = codexPricingTable[model] { return exact }
-    for (name, p) in codexPricingTable where model.hasPrefix(name) {
-        return p
+    if let best = codexPricingTable.filter({ model.hasPrefix($0.key) })
+        .max(by: { $0.key.count < $1.key.count }) {
+        return best.value
     }
     return codexFallbackPricing
 }

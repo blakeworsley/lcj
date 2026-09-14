@@ -12,8 +12,9 @@
 /// a plain file the CLI keeps fresh, so there is no Keychain ACL problem to
 /// route around and nothing for the user to copy.
 ///
-/// Failure vocabulary: no_token / no_spend_control / http_401 / network / bad_shape.
-/// A stale token (401) self-heals the next time the user runs Codex.
+/// Failure vocabulary: no_token / no_spend_control / http_401 / http_5xx /
+/// network / bad_shape. A stale token (401) self-heals the next time the user
+/// runs Codex.
 
 import ClusageCore
 import Foundation
@@ -95,7 +96,9 @@ final class CodexPlanFetcher: @unchecked Sendable {
         case 401, 403:
             return .degraded(reason: "http_401", updatedAt: now)
         default:
-            return .degraded(reason: "bad_shape", updatedAt: now)
+            // Matches UsageFetcher's vocabulary, where bad_shape means a decode
+            // failure and http_5xx means the server said no.
+            return .degraded(reason: "http_5xx", updatedAt: now)
         }
 
         guard let usage = CodexPlanUsage.parse(data) else {

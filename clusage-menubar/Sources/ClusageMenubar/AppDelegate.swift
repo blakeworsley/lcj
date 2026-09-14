@@ -29,6 +29,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var refreshTimer: Timer?
     /// Minute tick that repaints countdowns in the Remaining layout; display only.
     private var countdownTimer: Timer?
+    /// Guards against overlapping scans. A cold scan runs for tens of seconds
+    /// while the timer, wake, ⌘R and every provider toggle all call refreshAll(),
+    /// so without this two scans parse the same files, each occupy a utility
+    /// thread in synchronous file I/O, and can land out of order — a slow older
+    /// scan overwriting latestCodexState with staler data than is on screen.
+    private var scanInFlight = false
 
     // MARK: - applicationDidFinishLaunching
 
@@ -121,12 +127,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Kick the lanes for visible providers only. A hidden provider costs
     /// nothing: no claude.ai request, and no filesystem scan (the expensive one).
     /// Re-enabling a provider refreshes it immediately, so the pause is invisible.
+    ///
+    /// The Codex lanes also require an actual install. Without that gate, a Mac
+    /// with ~/.codex/auth.json but no sessions (signed in, logs cleaned up) would
+    /// send a Bearer-authenticated request to an undocumented endpoint on every
+    /// refresh, forever, while the UI never shows the result.
     private func refreshAll() {
         let visibility = ProviderVisibilityStore.load()
         if visibility.claude {
             fetcher.fetchNow()
         }
-        if visibility.codex {
+        if visibility.codex && CodexScanner.isCodexInstalled() {
             planFetcher.fetchNow()
             scanCodexNow()
         }
@@ -136,10 +147,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// WHY Task.detached: the first-ever scan reads hundreds of MB of session
     /// logs; inheriting the main actor would freeze the menu bar for seconds.
     private func scanCodexNow() {
+        guard !scanInFlight else { return }
+        scanInFlight = true
         Task.detached(priority: .utility) {
             let state = CodexScanner.shared.scan()
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                self.scanInFlight = false
                 self.latestCodexState = state
                 self.applyCodexState(state)
             }
@@ -170,6 +184,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func redraw() {
+        // One reference date per repaint: preferredWidth() measures the countdown
+        // text and draw() renders it, so two separate Date() reads could straddle
+        // a minute boundary and clip "1h" into "59m".
+        statusView.renderDate = Date()
         statusView.needsDisplay = true
         statusItem.length = statusView.preferredWidth()
     }
@@ -233,7 +251,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Sections mirror the menu bar: a hidden provider is absent here too.
         // Codex additionally needs an install to have anything to report, so a
-        // Claude-only Mac sees exactly the pre-Codex dropdown (no headers).
+        // Claude-only Mac sees no CLAUDE/CODEX headers and no Codex rows. It is
+        // not byte-for-byte the pre-Codex dropdown: the usage rows now say
+        // "% used", and Menu Bar Layout / Show in Menu Bar are always present.
         let visibility = ProviderVisibilityStore.load()
         let showCodexSection = visibility.codex && CodexScanner.isCodexInstalled()
         let showClaudeSection = visibility.claude || !showCodexSection
@@ -522,7 +542,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (i, provider) in Provider.allCases.enumerated() {
             let shown = visibility.isVisible(provider)
             var allowed = visibility.canToggle(provider)
-            if provider == .claude && shown && !codexUsable { allowed = false }
+            // Claude can't be hidden when Codex has nothing to show, and the
+            // Codex row itself is inert on a Mac without Codex — leaving it
+            // checked and clickable would promise a column that never appears.
+            if !codexUsable { allowed = false }
             let item = NSMenuItem(title: provider.displayName,
                                   action: allowed ? #selector(toggleProvider(_:)) : nil,
                                   keyEquivalent: "")
@@ -532,7 +555,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             submenu.addItem(item)
         }
         if !codexUsable {
-            addDisabledRow(to: submenu, title: "No Codex install detected (~/.codex/sessions)")
+            addDisabledRow(to: submenu, title: "No Codex install detected (~/.codex/sessions or archived_sessions)")
         }
 
         parent.submenu = submenu

@@ -348,12 +348,24 @@ func testAggregateCodexUsage() {
 func testCodexPricing() {
     let (cal, now) = codexTestCalendar()
 
-    expectEqual(codexPricing(forModel: "gpt-5.6-luna").output, 1.20, "codex pricing: exact table hit")
-    expectEqual(codexPricing(forModel: "gpt-5.6-luna-2026-09-01").output, 1.20, "codex pricing: prefix match on dated variant")
+    // Assert the RESOLUTION contract against the table, not against literal
+    // prices: re-pinning constants here would break the suite on every
+    // legitimate price update without testing any behaviour.
+    expectEqual(codexPricing(forModel: "gpt-5.6-luna"), codexPricingTable["gpt-5.6-luna"]!,
+                "codex pricing: exact table hit")
+    expectEqual(codexPricing(forModel: "gpt-5.6-luna-2026-09-01"), codexPricingTable["gpt-5.6-luna"]!,
+                "codex pricing: prefix match on dated variant")
     expectEqual(codexPricing(forModel: "codex-auto-review"), codexFallbackPricing, "codex pricing: unknown model → fallback")
     expectEqual(codexPricing(forModel: nil), codexFallbackPricing, "codex pricing: nil model → fallback")
-    expectEqual(codexPricing(forModel: "gpt-5.4-mini").output, 4.50, "codex pricing: gpt-5.4-mini in table")
-    expectEqual(codexPricing(forModel: "gpt-6-astra").output, 50.00, "codex pricing: gpt-6-astra in table")
+
+    // Ambiguous prefix: this name matches BOTH "gpt-5.4-mini" and "gpt-5.4".
+    // Dictionary iteration order is randomized per process, so a first-match
+    // scan returned either one depending on the launch (a 3.3x price swing);
+    // longest-match-wins is deterministic by construction.
+    expectEqual(codexPricing(forModel: "gpt-5.4-mini-2026-08-01"), codexPricingTable["gpt-5.4-mini"]!,
+                "codex pricing: ambiguous prefix resolves to the longest match")
+    expectEqual(codexPricing(forModel: "gpt-5.4-2026-08-01"), codexPricingTable["gpt-5.4"]!,
+                "codex pricing: shorter prefix still resolves when it is the longest match")
 
     // 1M uncached input + 1M cached + 1M output on luna: 0.20 + 0.02 + 1.20 = 1.42
     let lunaTurn = CodexTurn(timestamp: now, inputTokens: 2_000_000, cachedInputTokens: 1_000_000,
@@ -399,7 +411,12 @@ func testFormatCostAndTokens() {
     expectEqual(formatTokens(3_456_789), "3.5M", "formatTokens: millions")
     expectEqual(formatTokens(21_000_000), "21M", "formatTokens: trailing .0 dropped")
     expectEqual(formatTokens(1_234_567_890), "1.2B", "formatTokens: billions")
-    expectEqual(formatTokensLong(3_456_789), "3,456,789", "formatTokensLong: grouped")
+    // Pin the locale: a bare NumberFormatter follows Locale.current, so this
+    // would fail on a de_DE machine ("3.456.789") against a green patch.
+    expectEqual(formatTokensLong(3_456_789, locale: Locale(identifier: "en_US")), "3,456,789",
+                "formatTokensLong: grouped (en_US)")
+    expectEqual(formatTokensLong(3_456_789, locale: Locale(identifier: "de_DE")), "3.456.789",
+                "formatTokensLong: grouping follows the injected locale")
 }
 
 // MARK: - Tests: Codex plan usage (ChatGPT spend control)
@@ -515,6 +532,103 @@ func testProviderVisibilityToggling() {
     expectEqual(codexOnly.toggling(.claude), .both, "visibility: turning Claude back on restores both")
 }
 
+// MARK: - Tests: window edge cases
+
+/// Windows are built with Calendar arithmetic rather than 86_400-second math, so
+/// they must survive a DST transition. America/Denver falls back on 2026-11-01.
+func testSevenDayWindowCrossesDST() {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "America/Denver")!
+    let now = cal.date(from: DateComponents(year: 2026, month: 11, day: 3, hour: 14))!
+
+    func turn(_ date: Date, _ total: Int) -> CodexTurn {
+        CodexTurn(timestamp: date, inputTokens: total, cachedInputTokens: 0,
+                  outputTokens: 0, totalTokens: total)
+    }
+    // Window start is local midnight 6 days back: 2026-10-28 00:00 MDT.
+    let insideEdge = cal.date(from: DateComponents(year: 2026, month: 10, day: 28, hour: 0, minute: 30))!
+    let outsideEdge = cal.date(from: DateComponents(year: 2026, month: 10, day: 27, hour: 23, minute: 30))!
+    let summary = aggregateCodexUsage(
+        turnsBySession: ["a.jsonl": [turn(insideEdge, 100), turn(outsideEdge, 900)]],
+        now: now, calendar: cal)
+    expectEqual(summary.last7DaysTotal, 100,
+                "DST: 7-day window starts at local midnight 6 days back, not now minus 7x86400")
+    expectEqual(summary.last30DaysTotal, 1000, "DST: both turns are inside the 30-day window")
+}
+
+/// month-to-date on the 1st: only today counts, even though the 30-day window
+/// still reaches back into the previous month.
+func testMonthToDateOnFirstOfMonth() {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "America/Denver")!
+    let now = cal.date(from: DateComponents(year: 2026, month: 9, day: 1, hour: 0, minute: 30))!
+
+    func turn(_ date: Date, _ total: Int) -> CodexTurn {
+        CodexTurn(timestamp: date, inputTokens: total, cachedInputTokens: 0,
+                  outputTokens: 0, totalTokens: total)
+    }
+    let thisMonth = cal.date(from: DateComponents(year: 2026, month: 9, day: 1, hour: 0, minute: 10))!
+    let lastMonth = cal.date(from: DateComponents(year: 2026, month: 8, day: 31, hour: 23, minute: 50))!
+    let summary = aggregateCodexUsage(
+        turnsBySession: ["a.jsonl": [turn(thisMonth, 10), turn(lastMonth, 500)]],
+        now: now, calendar: cal)
+    expectEqual(summary.monthToDateTotal, 10, "MTD on the 1st excludes 10 minutes earlier in the previous month")
+    expectEqual(summary.last30DaysTotal, 510, "the 30-day window still includes the previous month")
+    expectEqual(summary.todayTotal, 10, "today starts at local midnight")
+}
+
+/// A clock-skewed or mis-stamped future line must not count anywhere — and must
+/// not advertise recent activity while every window reads zero.
+func testFutureDatedTurnIsIgnored() {
+    let (cal, now) = codexTestCalendar()
+    let future = cal.date(byAdding: .hour, value: 3, to: now)!
+    let summary = aggregateCodexUsage(
+        turnsBySession: ["a.jsonl": [
+            CodexTurn(timestamp: future, inputTokens: 999, cachedInputTokens: 0,
+                      outputTokens: 999, totalTokens: 999)]],
+        now: now, calendar: cal)
+    expectEqual(summary.todayTotal, 0, "future turn excluded from today")
+    expectEqual(summary.last30DaysTotal, 0, "future turn excluded from every window")
+    expect(summary.lastActivity == nil, "future turn does not set lastActivity")
+}
+
+/// A limits-only token_count event (payload.info null) still reports rate_limits.
+func testLimitsOnlyLineStillReportsLimits() {
+    let limitsOnly = """
+    {"timestamp":"2026-08-26T19:34:25.107Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"plan_type":"business","spend_control_reached":true}}}
+    """
+    guard let parsed = parseCodexLine(limitsOnly) else {
+        expect(false, "limits-only token_count line parses")
+        return
+    }
+    expect(parsed.turn == nil, "limits-only line yields no turn")
+    expectEqual(parsed.limitStatus?.spendControlReached, true, "limits-only line still reports spend_control_reached")
+    expect(parsed.limitStatus?.isLimited == true, "limits-only line flags as limited")
+}
+
+/// Defensive branches in the spend-control parser: malformed and out-of-range
+/// values must degrade rather than surface a wrong gauge.
+func testCodexPlanUsageDefensiveBranches() {
+    // Grouped numerals are not Double-parseable; nil means "fall back to budget".
+    expect(CodexPlanUsage.parse(#"{"spend_control":{"individual_limit":{"limit":"4,300","used":"100"}}}"#
+        .data(using: .utf8)!) == nil, "plan: grouped numeral limit degrades to nil rather than a wrong number")
+
+    if let zero = CodexPlanUsage.parse(#"{"spend_control":{"individual_limit":{"limit":0,"used":50}}}"#
+        .data(using: .utf8)!) {
+        expectEqual(zero.usedPercent, 0, "plan: zero limit never divides by zero")
+        expect(zero.remainingCredits == 0, "plan: remaining floors at zero when used exceeds limit")
+    } else {
+        expect(false, "plan: zero limit still parses")
+    }
+
+    if let over = CodexPlanUsage.parse(#"{"spend_control":{"individual_limit":{"limit":100,"used":250,"used_percent":250}}}"#
+        .data(using: .utf8)!) {
+        expectEqual(over.usedPercent, 100, "plan: out-of-range used_percent clamps to 100")
+    } else {
+        expect(false, "plan: over-limit body still parses")
+    }
+}
+
 // MARK: - Run all tests
 
 print("Running ClusageTests…")
@@ -542,6 +656,11 @@ testStartOfNextMonth()
 testMenuBarStyleNormalize()
 testProviderVisibilityDefaults()
 testProviderVisibilityToggling()
+testSevenDayWindowCrossesDST()
+testMonthToDateOnFirstOfMonth()
+testFutureDatedTurnIsIgnored()
+testLimitsOnlyLineStillReportsLimits()
+testCodexPlanUsageDefensiveBranches()
 
 if failures == 0 {
     print("OK — all tests passed")

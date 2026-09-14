@@ -154,25 +154,7 @@ public struct CodexSummary: Equatable, Sendable {
 /// well-formed `token_count` event (cheap substring pre-filter belongs in the caller).
 /// `model` is stamped by the caller from the most recent turn_context line.
 public func parseCodexTokenCountLine(_ line: String, model: String? = nil) -> CodexTurn? {
-    guard let payload = codexPayload(line),
-          payload["type"] as? String == "token_count",
-          let info = payload["info"] as? [String: Any],
-          let last = info["last_token_usage"] as? [String: Any],
-          let ts = codexLineTimestamp(line)
-    else { return nil }
-
-    func num(_ key: String) -> Int {
-        (last[key] as? NSNumber)?.intValue ?? 0
-    }
-
-    return CodexTurn(
-        timestamp: ts,
-        inputTokens: num("input_tokens"),
-        cachedInputTokens: num("cached_input_tokens"),
-        outputTokens: num("output_tokens"),
-        totalTokens: num("total_tokens"),
-        model: model
-    )
+    parseCodexLine(line, model: model)?.turn
 }
 
 /// Extract the model name from a `turn_context` line ("payload.model") or a
@@ -205,9 +187,73 @@ public func parseCodexModelLine(_ line: String) -> String? {
 /// Returns nil when the line has no rate_limits object.
 public func parseCodexLimitStatus(_ line: String) -> CodexLimitStatus? {
     guard let payload = codexPayload(line),
-          payload["type"] as? String == "token_count",
-          let rl = payload["rate_limits"] as? [String: Any]
+          payload["type"] as? String == "token_count"
     else { return nil }
+    return codexLimitStatus(payload: payload)
+}
+
+/// Everything one `token_count` line carries. Both halves are optional and
+/// independent: a limits-only event (payload.info null) still reports
+/// rate_limits, and a turn can appear on a line with no rate_limits block.
+public struct CodexLineParse: Equatable, Sendable {
+    public let turn: CodexTurn?
+    public let limitStatus: CodexLimitStatus?
+
+    public init(turn: CodexTurn?, limitStatus: CodexLimitStatus?) {
+        self.turn = turn
+        self.limitStatus = limitStatus
+    }
+}
+
+/// Parse one `token_count` line, decoding its JSON exactly once.
+///
+/// WHY this exists alongside the single-purpose helpers below: the scanner needs
+/// the timestamp, the token counts and the rate limits from the same line, and
+/// calling the three helpers decoded the same JSON three times. It also reads
+/// rate_limits independently of the turn, so a limits-only event no longer
+/// silently drops spend_control_reached / rate_limit_reached_type.
+/// Returns nil for any line that is not a well-formed token_count event.
+public func parseCodexLine(_ line: String, model: String? = nil) -> CodexLineParse? {
+    guard let doc = codexDocument(line) else { return nil }
+    return parseCodexLine(document: doc, model: model)
+}
+
+private func parseCodexLine(document doc: [String: Any], model: String?) -> CodexLineParse? {
+    guard let payload = doc["payload"] as? [String: Any],
+          payload["type"] as? String == "token_count"
+    else { return nil }
+
+    var turn: CodexTurn?
+    if let info = payload["info"] as? [String: Any],
+       let last = info["last_token_usage"] as? [String: Any],
+       let ts = parseCodexTimestamp(doc["timestamp"] as? String) {
+        func num(_ key: String) -> Int { (last[key] as? NSNumber)?.intValue ?? 0 }
+        turn = CodexTurn(
+            timestamp: ts,
+            inputTokens: num("input_tokens"),
+            cachedInputTokens: num("cached_input_tokens"),
+            outputTokens: num("output_tokens"),
+            totalTokens: num("total_tokens"),
+            model: model)
+    }
+    return CodexLineParse(turn: turn, limitStatus: codexLimitStatus(payload: payload))
+}
+
+/// Shared JSON decode: one line → top-level doc.
+private func codexDocument(_ line: String) -> [String: Any]? {
+    guard let data = line.data(using: .utf8),
+          let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    return doc
+}
+
+/// Shared JSON traversal: top-level doc → payload dict.
+private func codexPayload(_ line: String) -> [String: Any]? {
+    codexDocument(line)?["payload"] as? [String: Any]
+}
+
+private func codexLimitStatus(payload: [String: Any]) -> CodexLimitStatus? {
+    guard let rl = payload["rate_limits"] as? [String: Any] else { return nil }
 
     let credits = rl["credits"] as? [String: Any]
     var primaryPercent: Int?
@@ -226,21 +272,21 @@ public func parseCodexLimitStatus(_ line: String) -> CodexLimitStatus? {
     )
 }
 
-/// Shared JSON traversal: top-level doc → payload dict.
-private func codexPayload(_ line: String) -> [String: Any]? {
-    guard let data = line.data(using: .utf8),
-          let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return nil }
-    return doc["payload"] as? [String: Any]
-}
+/// Formatter construction dominates scan cost (~0.6 ms per call, once per
+/// token_count line), so both configurations are built once. ISO8601DateFormatter
+/// is safe to share for parsing as long as formatOptions is never mutated after
+/// setup — which is why there are two instances rather than one that is retuned.
+nonisolated(unsafe) private let codexISO8601WithFraction: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
 
-/// Top-level timestamp of a session line.
-private func codexLineTimestamp(_ line: String) -> Date? {
-    guard let data = line.data(using: .utf8),
-          let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return nil }
-    return parseCodexTimestamp(doc["timestamp"] as? String)
-}
+nonisolated(unsafe) private let codexISO8601Plain: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    return f
+}()
 
 /// Codex timestamps are ISO 8601 with milliseconds ("2026-08-26T19:34:20.829Z").
 ///
@@ -250,12 +296,8 @@ private func codexLineTimestamp(_ line: String) -> Date? {
 /// millisecond precision preserved for ordering turns within a session.
 public func parseCodexTimestamp(_ iso: String?) -> Date? {
     guard let iso else { return nil }
-    let fmt = ISO8601DateFormatter()
-    fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let d = fmt.date(from: iso) { return d }
-    // Fallback for lines without fractional seconds.
-    fmt.formatOptions = [.withInternetDateTime]
-    return fmt.date(from: iso)
+    // Fallback covers lines written without fractional seconds.
+    return codexISO8601WithFraction.date(from: iso) ?? codexISO8601Plain.date(from: iso)
 }
 
 // MARK: - Aggregation
@@ -296,12 +338,15 @@ public func aggregateCodexUsage(
     for (_, turns) in turnsBySession {
         var sessionActiveToday = false
         for t in turns {
+            // WHY after the guard: a clock-skewed or mis-stamped future line
+            // would otherwise report recent activity while every window shows
+            // zero usage, making the "no activity" row untrustworthy.
+            guard t.timestamp <= now else { continue }
             if let la = lastActivity {
                 if t.timestamp > la { lastActivity = t.timestamp }
             } else {
                 lastActivity = t.timestamp
             }
-            guard t.timestamp <= now else { continue }
             let cost = costOfCodexTurn(t)
             if t.timestamp >= monthWindowStart {
                 window30Total += t.totalTokens
@@ -366,8 +411,13 @@ public func formatTokens(_ n: Int) -> String {
 }
 
 /// Full-precision grouped count for dropdown rows: 3456789 → "3,456,789".
-public func formatTokensLong(_ n: Int) -> String {
+///
+/// Locale is injected for the same reason as the reset-time formatters: grouping
+/// separators are locale-specific ("3.456.789" on de_DE), so tests pin a locale
+/// while callers take the user's.
+public func formatTokensLong(_ n: Int, locale: Locale = .autoupdatingCurrent) -> String {
     let fmt = NumberFormatter()
     fmt.numberStyle = .decimal
+    fmt.locale = locale
     return fmt.string(from: NSNumber(value: n)) ?? "\(n)"
 }

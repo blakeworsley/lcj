@@ -49,7 +49,8 @@ cookie — paste it once, no keychain access, no API key setup.
 ## Codex column
 
 If the OpenAI Codex CLI (or Codex Desktop) is installed — i.e. `~/.codex/sessions`
-exists — Clusage adds a third column showing Codex usage next to the Claude gauges:
+or `~/.codex/archived_sessions` exists — Clusage adds a third column showing Codex
+usage next to the Claude gauges:
 
 ```
 5H  ▓▓░░ 42%  │  WK ▓░░░ 17%  │  1D $15.7    7D $29.7
@@ -79,10 +80,10 @@ reports.
 **Show in Menu Bar** lists both providers with a checkmark each — uncheck either
 to drop it from the menu bar and the dropdown. One must stay visible: the last
 checked provider is drawn greyed out, so the rule is apparent instead of a click
-that does nothing. (Claude also can't be hidden while no Codex install is
-detected, which would leave a bar of dashes.) A hidden provider costs nothing —
-no claude.ai request and no session-log scan — and is refreshed the moment you
-turn it back on.
+that does nothing. With no Codex install detected both entries are greyed out,
+since hiding Claude would leave a bar of dashes and the Codex entry promises a
+column that can't appear. A hidden provider costs nothing — no claude.ai request
+and no session-log scan — and is refreshed the moment you turn it back on.
 
 ### How Codex costs are estimated
 
@@ -99,9 +100,11 @@ sessions); unknown models use the mid-tier rate. Treat the numbers as
 API-equivalent estimates, not a bill — credit-plan internal rates may differ.
 
 The scanner covers a 32-day window and keeps a per-file `(mtime, size)` parse
-cache in `~/Library/Application Support/Clusage/`, so only the first-ever scan is
-slow (a few seconds for hundreds of MB of logs); every refresh after that
-re-reads only files that are actively being written.
+cache in `~/Library/Application Support/Clusage/`, so only the first-ever scan
+reads everything; every refresh after that re-reads just the files Codex is
+actively appending to, and the cache is only rewritten when it actually changed.
+Measured on an 814-file / 1.3 GB tree, a full parse of every in-window file takes
+about 9 seconds.
 
 Same gray-area disclaimer as the Claude endpoint: `wham/usage` is undocumented and
 may change. Clusage degrades to the budget barometer when it's unavailable, and
@@ -227,8 +230,10 @@ claude.ai/settings/usage and paste it into the dialog.
 then copy a fresh cookie via the same DevTools steps and paste it with
 **Set Session Cookie…**.
 
-**No Codex column** — the column only appears when `~/.codex/sessions` exists and
-**Show in Menu Bar → Codex** is checked. Run `codex` once to create the directory.
+**No Codex column** — the column only appears when `~/.codex/sessions` (or
+`~/.codex/archived_sessions`) exists and **Show in Menu Bar → Codex** is checked.
+Run `codex` once to create the directory. Without a Codex install both **Show in
+Menu Bar** entries are greyed out, since there is nothing to switch between.
 
 **`MO` shows dollars instead of a percent** — your ChatGPT plan reports no spend
 control, so the gauge falls back to the monthly budget barometer. If your workspace
