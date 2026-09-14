@@ -12,7 +12,9 @@ cookie — paste it once, no keychain access, no API key setup.
 **Colors:** green <70% · yellow 70–89% · red ≥90%  
 **Auto-refresh:** every 5 minutes by default (plus an immediate fetch on wake) — pick
 1/2/3/5/8/13 minutes via **Refresh Every** in the dropdown; the choice persists in the
-`com.mlg87.clusage-menubar` preferences domain under key `refresh_interval_minutes`.
+`com.mlg87.clusage-menubar` preferences domain under key `refresh_interval_minutes`.  
+**Providers:** show either Claude or Codex or both via **Show in Menu Bar** (keys
+`show_claude` / `codex_column_visible`) — see [Showing one provider or both](#showing-one-provider-or-both).
 
 ---
 
@@ -70,7 +72,17 @@ RESETS 9:00 PM │  F  ▓▓▓░ 90%  │  MO ▓▓▓░ 84%  RST 8/31
 
 The dropdown gains a **Codex** section with full-precision numbers, the per-model
 7-day breakdown, sessions active today, and any limit/spend-control flags OpenAI
-reports. **Codex Column → Show in Menu Bar** hides the column entirely.
+reports.
+
+### Showing one provider or both
+
+**Show in Menu Bar** lists both providers with a checkmark each — uncheck either
+to drop it from the menu bar and the dropdown. One must stay visible: the last
+checked provider is drawn greyed out, so the rule is apparent instead of a click
+that does nothing. (Claude also can't be hidden while no Codex install is
+detected, which would leave a bar of dashes.) A hidden provider costs nothing —
+no claude.ai request and no session-log scan — and is refreshed the moment you
+turn it back on.
 
 ### How Codex costs are estimated
 
@@ -216,7 +228,7 @@ then copy a fresh cookie via the same DevTools steps and paste it with
 **Set Session Cookie…**.
 
 **No Codex column** — the column only appears when `~/.codex/sessions` exists and
-**Codex Column → Show in Menu Bar** is checked. Run `codex` once to create the directory.
+**Show in Menu Bar → Codex** is checked. Run `codex` once to create the directory.
 
 **`MO` shows dollars instead of a percent** — your ChatGPT plan reports no spend
 control, so the gauge falls back to the monthly budget barometer. If your workspace

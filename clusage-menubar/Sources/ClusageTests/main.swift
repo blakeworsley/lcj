@@ -480,6 +480,41 @@ func testMenuBarStyleNormalize() {
     expectEqual(MenuBarStyle.defaultStyle, .grid, "style: default stays the historical grid")
 }
 
+// MARK: - Tests: provider visibility
+
+func testProviderVisibilityDefaults() {
+    expect(ProviderVisibility.both.isVisible(.claude) && ProviderVisibility.both.isVisible(.codex),
+           "visibility: .both shows both providers")
+    expectEqual(ProviderVisibility.normalize(claude: true, codex: true), .both,
+                "visibility: both stored on round-trips")
+    expectEqual(ProviderVisibility.normalize(claude: true, codex: false), .claudeOnly,
+                "visibility: Claude-only round-trips")
+    expectEqual(ProviderVisibility.normalize(claude: false, codex: true),
+                ProviderVisibility(claude: false, codex: true), "visibility: Codex-only round-trips")
+    // Impossible state (hand-edited defaults) repairs to the app's original behaviour.
+    expectEqual(ProviderVisibility.normalize(claude: false, codex: false), .claudeOnly,
+                "visibility: neither visible repairs to Claude-only")
+}
+
+func testProviderVisibilityToggling() {
+    let both = ProviderVisibility.both
+    expect(both.canToggle(.claude) && both.canToggle(.codex), "visibility: with both on, either may be hidden")
+    expectEqual(both.toggling(.claude), ProviderVisibility(claude: false, codex: true),
+                "visibility: hiding Claude leaves Codex")
+    expectEqual(both.toggling(.codex), .claudeOnly, "visibility: hiding Codex leaves Claude")
+
+    // The last visible provider cannot be hidden — the menu disables that item.
+    let claudeOnly = ProviderVisibility.claudeOnly
+    expect(!claudeOnly.canToggle(.claude), "visibility: last provider (Claude) cannot be hidden")
+    expect(claudeOnly.toggling(.claude) == nil, "visibility: hiding the last provider returns nil")
+    expect(claudeOnly.canToggle(.codex), "visibility: the hidden provider can always be turned back on")
+    expectEqual(claudeOnly.toggling(.codex), .both, "visibility: turning Codex back on restores both")
+
+    let codexOnly = ProviderVisibility(claude: false, codex: true)
+    expect(!codexOnly.canToggle(.codex), "visibility: last provider (Codex) cannot be hidden")
+    expectEqual(codexOnly.toggling(.claude), .both, "visibility: turning Claude back on restores both")
+}
+
 // MARK: - Run all tests
 
 print("Running ClusageTests…")
@@ -505,6 +540,8 @@ testMenuBarShortDate()
 testMenuBarCountdown()
 testStartOfNextMonth()
 testMenuBarStyleNormalize()
+testProviderVisibilityDefaults()
+testProviderVisibilityToggling()
 
 if failures == 0 {
     print("OK — all tests passed")

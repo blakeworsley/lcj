@@ -44,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // First run: no cookie stored → open the paste dialog once, after launch settles.
         // WHY DispatchQueue.main.async: gives AppKit time to finish setting up the status
         // item before we show an alert; calling runModal() during launch can hang the app.
-        if CookieStore.load() == nil {
+        if CookieStore.load() == nil && statusView.visibility.claude {
             DispatchQueue.main.async { self.promptForCookie() }
         }
     }
@@ -85,7 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusView = StatusBarView(frame: button.bounds)
         statusView.style = MenuBarStyleStore.load()
         setupCountdownTimer()
-        statusView.codexColumnEnabled = CodexDisplayStore.isColumnVisible()
+        statusView.visibility = ProviderVisibilityStore.load()
         statusView.codexShowsDollars = CodexDisplayStore.showsDollars()
         statusView.codexBudget = CodexBudgetStore.load()
         statusView.autoresizingMask = [.width, .height]
@@ -118,11 +118,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Kick every lane. Codex lanes are cheap no-ops without a Codex install.
+    /// Kick the lanes for visible providers only. A hidden provider costs
+    /// nothing: no claude.ai request, and no filesystem scan (the expensive one).
+    /// Re-enabling a provider refreshes it immediately, so the pause is invisible.
     private func refreshAll() {
-        fetcher.fetchNow()
-        planFetcher.fetchNow()
-        scanCodexNow()
+        let visibility = ProviderVisibilityStore.load()
+        if visibility.claude {
+            fetcher.fetchNow()
+        }
+        if visibility.codex {
+            planFetcher.fetchNow()
+            scanCodexNow()
+        }
     }
 
     /// Run the blocking filesystem scan off the main thread, then apply on main.
@@ -224,25 +231,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        // The Codex section (and the CLAUDE/CODEX headers that make two sections
-        // readable) exist only when Codex is installed and the column is enabled;
-        // otherwise the dropdown is exactly the pre-Codex layout.
-        let showCodexSection = CodexDisplayStore.isColumnVisible() && CodexScanner.isCodexInstalled()
+        // Sections mirror the menu bar: a hidden provider is absent here too.
+        // Codex additionally needs an install to have anything to report, so a
+        // Claude-only Mac sees exactly the pre-Codex dropdown (no headers).
+        let visibility = ProviderVisibilityStore.load()
+        let showCodexSection = visibility.codex && CodexScanner.isCodexInstalled()
+        let showClaudeSection = visibility.claude || !showCodexSection
 
-        if showCodexSection { addSectionHeader(to: menu, title: "Claude") }
-        switch latestState {
-        case .ok(let snap, let updatedAt):
-            addUsageRows(to: menu, snap: snap)
-            addUpdatedRow(to: menu, updatedAt: updatedAt)
-        case .degraded(let reason, let updatedAt):
-            addDegradedRow(to: menu, reason: reason)
-            addUpdatedRow(to: menu, updatedAt: updatedAt)
-        case nil:
-            addDisabledRow(to: menu, title: "Waiting for first fetch…")
+        if showClaudeSection && showCodexSection { addSectionHeader(to: menu, title: "Claude") }
+        if showClaudeSection {
+            switch latestState {
+            case .ok(let snap, let updatedAt):
+                addUsageRows(to: menu, snap: snap)
+                addUpdatedRow(to: menu, updatedAt: updatedAt)
+            case .degraded(let reason, let updatedAt):
+                addDegradedRow(to: menu, reason: reason)
+                addUpdatedRow(to: menu, updatedAt: updatedAt)
+            case nil:
+                addDisabledRow(to: menu, title: "Waiting for first fetch…")
+            }
         }
 
         if showCodexSection {
-            menu.addItem(.separator())
+            if showClaudeSection { menu.addItem(.separator()) }
             addSectionHeader(to: menu, title: "Codex")
             switch latestCodexState {
             case .ok(let summary, let updatedAt):
@@ -259,8 +270,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addRefreshItem(to: menu)
         addRefreshIntervalItem(to: menu)
         addMenuBarLayoutItem(to: menu)
-        addCodexColumnItem(to: menu)
-        addSetCookieItem(to: menu)
+        addShowInMenuBarItem(to: menu)
+        if showCodexSection { addCodexColumnItem(to: menu) }
+        if showClaudeSection { addSetCookieItem(to: menu) }
         addLaunchAtLoginItem(to: menu)
         menu.addItem(.separator())
         addQuitItem(to: menu)
@@ -496,22 +508,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Codex column settings
 
-    /// One "Codex Column" submenu holds every Codex preference so the top level
-    /// stays as short as before: visibility, $ vs tokens, and the fallback budget.
+    /// Per-provider visibility. Either can be hidden, never both: the last
+    /// visible provider's item is drawn checked but disabled (action nil) so the
+    /// rule is visible in the menu rather than a click that silently does
+    /// nothing. Hiding Claude is also blocked when Codex has no install to
+    /// report on, which would otherwise leave a menu bar of dashes.
+    private func addShowInMenuBarItem(to menu: NSMenu) {
+        let parent = NSMenuItem(title: "Show in Menu Bar", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let visibility = ProviderVisibilityStore.load()
+        let codexUsable = CodexScanner.isCodexInstalled()
+
+        for (i, provider) in Provider.allCases.enumerated() {
+            let shown = visibility.isVisible(provider)
+            var allowed = visibility.canToggle(provider)
+            if provider == .claude && shown && !codexUsable { allowed = false }
+            let item = NSMenuItem(title: provider.displayName,
+                                  action: allowed ? #selector(toggleProvider(_:)) : nil,
+                                  keyEquivalent: "")
+            item.tag = i   // index into Provider.allCases
+            item.state = shown ? .on : .off
+            if allowed { item.target = self }
+            submenu.addItem(item)
+        }
+        if !codexUsable {
+            addDisabledRow(to: submenu, title: "No Codex install detected (~/.codex/sessions)")
+        }
+
+        parent.submenu = submenu
+        menu.addItem(parent)
+    }
+
+    @objc private func toggleProvider(_ sender: NSMenuItem) {
+        let providers = Provider.allCases
+        guard providers.indices.contains(sender.tag),
+              let next = ProviderVisibilityStore.load().toggling(providers[sender.tag])
+        else { return }
+        ProviderVisibilityStore.save(next)
+        statusView.visibility = next
+        // A provider just turned back on has stale (or no) data — refresh now so
+        // it doesn't sit on dashes until the next tick.
+        refreshAll()
+        redraw()
+    }
+
+    /// One "Codex Column" submenu holds the remaining Codex preferences:
+    /// $ vs tokens, and the fallback budget.
     private func addCodexColumnItem(to menu: NSMenu) {
         let parent = NSMenuItem(title: "Codex Column", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
 
-        let visible = NSMenuItem(title: "Show in Menu Bar",
-                                 action: #selector(toggleCodexColumn), keyEquivalent: "")
-        visible.state = CodexDisplayStore.isColumnVisible() ? .on : .off
-        visible.target = self
-        submenu.addItem(visible)
-        if !CodexScanner.isCodexInstalled() {
-            addDisabledRow(to: submenu, title: "No Codex install detected (~/.codex/sessions)")
-        }
-
-        submenu.addItem(.separator())
         let dollars = CodexDisplayStore.showsDollars()
         let dollarItem = NSMenuItem(title: "Estimated Cost ($)", action: #selector(setCodexDisplay(_:)), keyEquivalent: "")
         dollarItem.tag = 1
@@ -541,13 +587,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         parent.submenu = submenu
         menu.addItem(parent)
-    }
-
-    @objc private func toggleCodexColumn() {
-        let next = !CodexDisplayStore.isColumnVisible()
-        CodexDisplayStore.save(columnVisible: next)
-        statusView.codexColumnEnabled = next
-        redraw()
     }
 
     @objc private func setCodexDisplay(_ sender: NSMenuItem) {

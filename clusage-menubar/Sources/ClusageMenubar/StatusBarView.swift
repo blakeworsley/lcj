@@ -6,9 +6,9 @@
 ///   Codex column: 1D cost · 7D cost (top) / MO gauge · RST date (bottom)
 /// Columns are separated by a vertical rule. 7pt labels / 9pt monospaced-digit values.
 ///
-/// The Codex column only appears when a Codex install is detected (and the user
-/// hasn't hidden it), so Claude-only users see the original two-column layout
-/// unchanged. Claude cells are percent-of-limit gauges; Codex 1D/7D are dollar
+/// Either provider can be hidden (never both — see ClusageCore.ProviderVisibility),
+/// and the Codex column additionally stays hidden when no Codex install is
+/// detected, so Claude-only users see the original two-column layout unchanged. Claude cells are percent-of-limit gauges; Codex 1D/7D are dollar
 /// estimates (or token counts) because Codex plans expose no 5h/weekly windows.
 /// The MO cell is a real percent-of-limit gauge when ChatGPT reports a monthly
 /// spend control, otherwise a month-to-date $ against the user's budget.
@@ -73,18 +73,28 @@ final class StatusBarView: NSView {
     /// Monthly spend-control state from ChatGPT; when present the MO cell is a
     /// true percent-of-limit gauge instead of the $-budget barometer.
     var codexPlan: CodexPlanUsage?
-    /// The user's "Show in Menu Bar" preference for the Codex column.
-    var codexColumnEnabled = true
+    /// Which providers the user wants shown (ProviderVisibilityStore).
+    var visibility: ProviderVisibility = .both
     /// Which layout to draw (MenuBarStyleStore). AppDelegate repaints every
     /// minute in .remaining so the countdowns stay current.
     var style: MenuBarStyle = .grid
 
-    /// The Codex column renders only with the preference on AND some Codex data
-    /// available. codexSummary is nil until the first successful scan and stays
-    /// nil when ~/.codex has no sessions, so Claude-only Macs never grow a
-    /// dashed-out third column.
+    /// Codex renders when the user wants it AND either it has data or it is the
+    /// only provider selected. The data condition keeps Claude-only Macs from
+    /// growing a dashed-out third column (codexSummary stays nil when ~/.codex
+    /// has no sessions); the "only provider" condition means someone who hid
+    /// Claude still sees a Codex block from launch instead of an empty bar that
+    /// fills in a second later.
     var showsCodexColumn: Bool {
-        codexColumnEnabled && (codexSummary != nil || codexPlan != nil)
+        guard visibility.codex else { return false }
+        return codexSummary != nil || codexPlan != nil || !visibility.claude
+    }
+
+    /// Claude renders when the user wants it, and also whenever Codex ends up
+    /// drawing nothing — the status item must never be blank, even if Codex is
+    /// uninstalled while Claude is hidden.
+    var showsClaudeColumn: Bool {
+        visibility.claude || !showsCodexColumn
     }
 
     // MARK: - Init
@@ -125,12 +135,14 @@ final class StatusBarView: NSView {
     }
 
     private func gridPreferredWidth() -> CGFloat {
-        let m = gridMetrics()
         let sepUnit = Self.sepPad + Self.sepW + Self.sepPad
-        var w = 2 + m.leftColW + sepUnit + m.rightColW + 2
-        if showsCodexColumn {
-            w += sepUnit + cellGridWidth(codexGridColumns())
+        var w: CGFloat = 4   // 2pt inset on each side
+        if showsClaudeColumn {
+            let m = gridMetrics()
+            w += m.leftColW + sepUnit + m.rightColW
+            if showsCodexColumn { w += sepUnit }
         }
+        if showsCodexColumn { w += cellGridWidth(codexGridColumns()) }
         return w
     }
 
@@ -187,24 +199,27 @@ final class StatusBarView: NSView {
     }
 
     private func drawGrid() {
-        let e = entriesForDisplay()
-        let m = gridMetrics()
         let midY = bounds.midY
         let topY = midY + Self.rowOffset
         let botY = midY - Self.rowOffset
-        let x0: CGFloat = 2
+        var x: CGFloat = 2
 
-        drawRow(entry: e.session, x: x0, centerY: topY, labelW: m.leftLabelW,  pctW: m.pctW)
-        drawTimeRow(x: x0, centerY: botY, labelW: m.leftLabelW)
+        if showsClaudeColumn {
+            let e = entriesForDisplay()
+            let m = gridMetrics()
+            drawRow(entry: e.session, x: x, centerY: topY, labelW: m.leftLabelW, pctW: m.pctW)
+            drawTimeRow(x: x, centerY: botY, labelW: m.leftLabelW)
 
-        let rx = drawSeparator(x: x0 + m.leftColW, midY: midY)
+            x = drawSeparator(x: x + m.leftColW, midY: midY)
+            drawRow(entry: e.week,  x: x, centerY: topY, labelW: m.rightLabelW, pctW: m.pctW)
+            drawRow(entry: e.fable, x: x, centerY: botY, labelW: m.rightLabelW, pctW: m.pctW)
+            x += m.rightColW
 
-        drawRow(entry: e.week,  x: rx, centerY: topY, labelW: m.rightLabelW, pctW: m.pctW)
-        drawRow(entry: e.fable, x: rx, centerY: botY, labelW: m.rightLabelW, pctW: m.pctW)
+            if showsCodexColumn { x = drawSeparator(x: x, midY: midY) }
+        }
 
         if showsCodexColumn {
-            let cx = drawSeparator(x: rx + m.rightColW, midY: midY)
-            drawCellGrid(codexGridColumns(), x: cx, topY: topY, botY: botY)
+            drawCellGrid(codexGridColumns(), x: x, topY: topY, botY: botY)
         }
     }
 
@@ -493,10 +508,12 @@ final class StatusBarView: NSView {
 
     private func remainingPreferredWidth() -> CGFloat {
         let now = Date()
-        var w = 2 + remainingBlockWidth(claudeRemainingRows(now: now)) + 2
-        if showsCodexColumn {
-            w += Self.sepPad + Self.sepW + Self.sepPad + remainingBlockWidth(codexRemainingRows(now: now))
+        var w: CGFloat = 4   // 2pt inset on each side
+        if showsClaudeColumn {
+            w += remainingBlockWidth(claudeRemainingRows(now: now))
+            if showsCodexColumn { w += Self.sepPad + Self.sepW + Self.sepPad }
         }
+        if showsCodexColumn { w += remainingBlockWidth(codexRemainingRows(now: now)) }
         return w
     }
 
@@ -504,11 +521,13 @@ final class StatusBarView: NSView {
         let now = Date()
         let midY = bounds.midY
         var x: CGFloat = 2
-        x = drawRemainingBlock(claudeRemainingRows(now: now), x: x, midY: midY) { center in
-            self.drawClaudeIcon(center: center)
+        if showsClaudeColumn {
+            x = drawRemainingBlock(claudeRemainingRows(now: now), x: x, midY: midY) { center in
+                self.drawClaudeIcon(center: center)
+            }
+            if showsCodexColumn { x = drawSeparator(x: x, midY: midY) }
         }
         if showsCodexColumn {
-            x = drawSeparator(x: x, midY: midY)
             drawRemainingBlock(codexRemainingRows(now: now), x: x, midY: midY) { center in
                 self.drawCodexIcon(center: center)
             }
